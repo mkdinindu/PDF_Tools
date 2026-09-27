@@ -1,0 +1,1185 @@
+#!/usr/bin/env python3
+"""Reusable UI building blocks: cards, buttons, drop zones, file lists,
+page grids, toasts and progress. Everything is themed through ``theme``."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtProperty,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QCursor,
+    QFont,
+    QKeyEvent,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QStyledItemDelegate,
+    QVBoxLayout,
+    QWidget,
+)
+
+import theme as T
+from pdf_core import FileInfo
+
+CARD_SHADOW = (16, 24, 40, 12)
+
+
+# ---------------------------------------------------------------- helpers
+def enable_drag(widget: QWidget) -> None:
+    widget.setAcceptDrops(True)
+
+
+def soft_shadow(widget: QWidget, blur: int = 28, dy: int = 6, alpha: float = 0.055) -> None:
+    effect = QGraphicsDropShadowEffect(widget)
+    effect.setBlurRadius(blur)
+    effect.setOffset(0, dy)
+    color = QColor(16, 24, 40)
+    color.setAlphaF(alpha)
+    effect.setColor(color)
+    widget.setGraphicsEffect(effect)
+
+
+def label(text: str, size: int = 13, weight: int = 400, color: str = T.TEXT,
+          role: str = "") -> QLabel:
+    lab = QLabel(text)
+    f = QFont(T.ui_font_family() or "Sans Serif")
+    f.setPixelSize(size)
+    f.setWeight(QFont.Weight(weight))
+    lab.setFont(f)
+    if color:
+        lab.setStyleSheet(f"color: {color};")
+    if role:
+        lab.setObjectName(role)
+    return lab
+
+
+def set_role(widget: QWidget, role: str) -> QWidget:
+    widget.setObjectName(role)
+    return widget
+
+
+def divider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("Divider")
+    line.setFrameShape(QFrame.Shape.NoFrame)
+    line.setFixedHeight(1)
+    return line
+
+
+# ---------------------------------------------------------------- surfaces
+class Card(QFrame):
+    """White rounded surface with a whisper of depth."""
+
+    def __init__(self, parent: QWidget | None = None, sunken: bool = False, pad: int = 20,
+                 shadow: bool = True):
+        super().__init__(parent)
+        self.setObjectName("CardSunken" if sunken else "Card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(pad, pad, pad, pad)
+        outer.setSpacing(14)
+        if shadow and not sunken:
+            soft_shadow(self)
+        self.body = outer
+
+    def add(self, widget: QWidget, stretch: int = 0) -> QWidget:
+        self.body.addWidget(widget, stretch)
+        return widget
+
+    def add_layout(self, layout) -> None:
+        self.body.addLayout(layout)
+
+
+class SectionHeader(QWidget):
+    """Title + optional description + optional right-hand slot."""
+
+    def __init__(self, title: str, description: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        column = QVBoxLayout()
+        column.setSpacing(3)
+        self.title = label(title, 14, 700, T.TEXT, "SectionTitle")
+        column.addWidget(self.title)
+        self.description: QLabel | None = None
+        if description:
+            self.description = label(description, 12, 400, T.TEXT_MUTED)
+            self.description.setWordWrap(True)
+            column.addWidget(self.description)
+        row.addLayout(column, 1)
+        self.slot = QHBoxLayout()
+        self.slot.setSpacing(8)
+        row.addLayout(self.slot)
+
+    def set_description(self, text: str) -> None:
+        if self.description is None:
+            self.description = label(text, 12, 400, T.TEXT_MUTED)
+            self.description.setWordWrap(True)
+            self.slot.parent().layout().insertWidget(0, self.description)
+        else:
+            self.description.setText(text)
+
+    def add_action(self, widget: QWidget) -> QWidget:
+        self.slot.addWidget(widget)
+        return widget
+
+
+# ---------------------------------------------------------------- buttons
+class Button(QPushButton):
+    def __init__(self, text: str = "", variant: str = "default", icon: str = "",
+                 parent: QWidget | None = None, tooltip: str = ""):
+        super().__init__(text, parent)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.variant = variant
+        roles = {"primary": "Primary", "accent": "Accent", "soft": "Soft",
+                 "danger": "Danger", "ghost": "Ghost", "icon": "IconButton"}
+        self.setObjectName(roles.get(variant, ""))
+        if icon:
+            self.setIcon(T.make_icon(icon, 17, self._icon_color()))
+            self.setIconSize(QSize(17, 17))
+        if tooltip:
+            self.setToolTip(tooltip)
+        self._restyle_on_hover = variant in ("primary", "accent", "danger", "soft", "default")
+
+    def _icon_color(self) -> str:
+        return T.TEXT_ON_ACCENT if self.variant in ("primary", "accent") else T.TEXT_MUTED
+
+    def enterEvent(self, event):
+        if self._restyle_on_hover and self.isEnabled():
+            color = {"primary": T.ACCENT_HOVER, "accent": T.ACCENT_HOVER,
+                     "danger": T.DANGER, "soft": T.ACCENT_SOFT_HOVER}.get(self.variant)
+            if color:
+                self.setIcon(T.make_icon(self._icon_name(), 17, color))
+        super().enterEvent(event)
+
+    def _icon_name(self) -> str:
+        return getattr(self, "_icon_key", "")
+
+    def leaveEvent(self, event):
+        if self._restyle_on_hover and self.isEnabled():
+            self.setIcon(T.make_icon(self._icon_key, 17, self._icon_color()))
+        super().leaveEvent(event)
+
+
+def primary_button(text: str, icon: str = "", on_click=None, tooltip: str = "") -> Button:
+    btn = Button(text, "primary", icon, tooltip=tooltip)
+    btn._icon_key = icon
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+def secondary_button(text: str, icon: str = "", on_click=None, tooltip: str = "") -> Button:
+    btn = Button(text, "default", icon, tooltip=tooltip)
+    btn._icon_key = icon
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+def soft_button(text: str, icon: str = "", on_click=None, tooltip: str = "") -> Button:
+    btn = Button(text, "soft", icon, tooltip=tooltip)
+    btn._icon_key = icon
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+def danger_button(text: str, icon: str = "", on_click=None, tooltip: str = "") -> Button:
+    btn = Button(text, "danger", icon, tooltip=tooltip)
+    btn._icon_key = icon
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+def ghost_button(text: str, icon: str = "", on_click=None, tooltip: str = "") -> Button:
+    btn = Button(text, "ghost", icon, tooltip=tooltip)
+    btn._icon_key = icon
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+def icon_button(icon: str, on_click=None, tooltip: str = "", size: int = 30,
+                color: str = T.TEXT_MUTED, danger: bool = False) -> Button:
+    btn = Button("", "icon", tooltip=tooltip)
+    btn._icon_key = icon
+    if danger:
+        btn.setObjectName("IconButtonDanger")
+    btn.setIcon(T.make_icon(icon, int(size * 0.58), T.DANGER if danger else color))
+    btn.setIconSize(QSize(int(size * 0.58), int(size * 0.58)))
+    btn.setFixedSize(size, size)
+    if on_click:
+        btn.clicked.connect(on_click)
+    return btn
+
+
+class SegmentedControl(QWidget):
+    """Pill-style exclusive choice."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, options: list[tuple[str, str]], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Segment")
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 4, 4, 4)
+        row.setSpacing(2)
+        self._buttons: dict[str, Button] = {}
+        for key, text in options:
+            btn = Button(text, "default")
+            btn.setObjectName("SegmentItem")
+            btn.setCheckable(True)
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(lambda _checked, k=key: self._pick(k))
+            row.addWidget(btn)
+            self._buttons[key] = btn
+        if options:
+            self._buttons[options[0][0]].setChecked(True)
+        self._value = options[0][0] if options else ""
+
+    def _pick(self, key: str) -> None:
+        if key == self._value and self._buttons[key].isChecked():
+            return
+        self._value = key
+        for k, btn in self._buttons.items():
+            btn.setChecked(k == key)
+        self.changed.emit(key)
+
+    def value(self) -> str:
+        return self._value
+
+    def set_value(self, key: str) -> None:
+        if key in self._buttons and key != self._value:
+            self._pick(key)
+
+
+# ---------------------------------------------------------------- inputs
+class SearchField(QLineEdit):
+    def __init__(self, placeholder: str = "Search", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Search")
+        self.setPlaceholderText(placeholder)
+        self.setFixedHeight(36)
+        self.addAction(T.make_icon("search", 16, T.TEXT_SUBTLE),
+                       QLineEdit.ActionPosition.LeadingPosition)
+
+
+class ToggleSwitch(QWidget):
+    """Small animated on/off switch."""
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, checked: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._checked = checked
+        self._knob = 1.0 if checked else 0.0
+        self.setFixedSize(40, 23)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._anim.finished.connect(lambda: self.update())
+
+    def get_knob(self) -> float:
+        return self._knob
+
+    def set_knob(self, value: float) -> None:
+        self._knob = value
+        self.update()
+
+    knob = pyqtProperty(float, get_knob, set_knob)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._checked:
+            return
+        self._checked = value
+        self._anim.stop()
+        self._anim.setStartValue(self._knob)
+        self._anim.setEndValue(1.0 if value else 0.0)
+        self._anim.start()
+        self.toggled.emit(value)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track_on, track_off = QColor(T.ACCENT), QColor(T.BORDER_STRONG)
+        pos = max(0.0, min(1.0, self._knob))
+        track = QColor(
+            round(track_off.red() + (track_on.red() - track_off.red()) * pos),
+            round(track_off.green() + (track_on.green() - track_off.green()) * pos),
+            round(track_off.blue() + (track_on.blue() - track_off.blue()) * pos),
+        )
+        radius = self.height() / 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), radius, radius)
+        knob_x = 3 + 17 * pos
+        painter.setPen(QPen(QColor(0, 0, 0, 18), 1))
+        painter.setBrush(QColor(T.SURFACE))
+        painter.drawEllipse(QPointF(knob_x + 8.5, self.height() / 2), 8.5, 8.5)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        self.setChecked(not self._checked)
+
+
+class FieldRow(QWidget):
+    """Labelled input with a monospace path readout underneath."""
+
+    def __init__(self, caption: str, placeholder: str = "", value: str = "",
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(6)
+        self.caption = label(caption, 12, 600, T.TEXT_MUTED, "FieldLabel")
+        column.addWidget(self.caption)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.input = QLineEdit(value)
+        self.input.setPlaceholderText(placeholder)
+        row.addWidget(self.input, 1)
+        self.browse = secondary_button("Browse", "folder", self._browse)
+        row.addWidget(self.browse)
+        column.addLayout(row)
+        self._browsed = False
+
+    def _browse(self) -> None:
+        self._browsed = True
+
+    def text(self) -> str:
+        return self.input.text().strip()
+
+    def set_text(self, value: str) -> None:
+        self.input.setText(value)
+
+
+# ---------------------------------------------------------------- drop zone
+class DropZone(QFrame):
+    """Dashed drop target that doubles as the primary call to action."""
+
+    files_dropped = pyqtSignal(list)
+    clicked = pyqtSignal()
+
+    def __init__(self, title: str, hint: str, icon: str = "file",
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("CardSunken")
+        self._hover = False
+        self._icon = icon
+        self._active = True
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(132)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 22, 18, 22)
+        layout.setSpacing(5)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.badge = _IconBadge(icon)
+        row = QHBoxLayout()
+        row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(self.badge)
+        layout.addLayout(row)
+
+        self.title = label(title, 14, 600, T.TEXT)
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title)
+        self.hint = label(hint, 12, 400, T.TEXT_MUTED)
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.hint)
+
+    def set_state(self, title: str, hint: str, icon: str | None = None) -> None:
+        self.title.setText(title)
+        self.hint.setText(hint)
+        if icon:
+            self._icon = icon
+            self.badge.set_icon(icon)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self.setEnabled(active)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor) if active
+                       else QCursor(Qt.CursorShape.ArrowCursor))
+
+    def enterEvent(self, event):
+        if self._active:
+            self._hover = True
+            self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._active and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event):
+        if not self._active:
+            event.ignore()
+            return
+        if event.mimeData().hasUrls():
+            self._hover = True
+            self.update()
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._hover = False
+        self.update()
+
+    def dropEvent(self, event):
+        self._hover = False
+        self.update()
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        active = self._active
+        hot = self._hover and active
+        border = T.ACCENT if hot else (T.BORDER_STRONG if active else T.BORDER)
+        width = 2.0 if hot else 1.4
+        painter.setPen(QPen(QColor(border), width, Qt.PenStyle.DashLine if active else Qt.PenStyle.SolidLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        radius = T.RADIUS
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), radius, radius)
+        if hot:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(T.alpha(T.ACCENT, 0.05))
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect().adjusted(1, 1, -1, -1)), radius, radius)
+            painter.drawPath(path)
+        painter.end()
+
+
+class _IconBadge(QWidget):
+    """Rounded gradient (or flat) tile holding a single line icon."""
+
+    def __init__(self, icon: str, size: int = 44, tone: tuple[str, str] | None = None,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._icon = icon
+        self._tone = tone
+        self.setFixedSize(size, size)
+
+    def set_icon(self, icon: str) -> None:
+        self._icon = icon
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0, 0, self.width(), self.height())
+        painter.setPen(Qt.PenStyle.NoPen)
+        if self._tone:
+            painter.setBrush(QColor(self._tone[0]))
+            icon_color = self._tone[1]
+        else:
+            gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            gradient.setColorAt(0.0, QColor(T.ACCENT))
+            gradient.setColorAt(1.0, QColor("#8B5CF6"))
+            painter.setBrush(QBrush(gradient))
+            icon_color = T.TEXT_ON_ACCENT
+        radius = rect.height() * 0.32
+        painter.drawRoundedRect(rect, radius, radius)
+        inset = QRectF(rect.x() + rect.width() * 0.26, rect.y() + rect.height() * 0.26,
+                      rect.width() * 0.48, rect.height() * 0.48)
+        T.draw_icon(painter, self._icon, inset, icon_color, 1.9)
+        painter.end()
+
+
+class Badge(QLabel):
+    """Small pill, e.g. page counts or file sizes."""
+
+    def __init__(self, text: str = "", tone: str = "neutral", parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self.set_tone(tone)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_tone(self, tone: str) -> None:
+        palette = {
+            "neutral": (T.SURFACE_ALT, T.TEXT_MUTED),
+            "accent": (T.ACCENT_SOFT, T.ACCENT),
+            "success": (T.SUCCESS_SOFT, T.SUCCESS),
+            "danger": (T.DANGER_SOFT, T.DANGER),
+            "warning": (T.WARNING_SOFT, T.WARNING),
+        }
+        bg, fg = palette.get(tone, palette["neutral"])
+        f = QFont(T.ui_font_family() or "Sans Serif")
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight(600))
+        self.setFont(f)
+        self.setStyleSheet(
+            f"background: {bg}; color: {fg}; border-radius: 6px; padding: 3px 7px;")
+
+
+# ---------------------------------------------------------------- file list
+class FileStripItem(QWidget):
+    """One row in the merge queue."""
+
+    def __init__(self, info: FileInfo, index: int, on_remove=None, on_move=None,
+                 total: int = 1, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.info = info
+        self.index = index
+        self._on_remove = on_remove
+        self._on_move = on_move
+        self._total = total
+        self.setFixedHeight(62)
+        self.setObjectName("CardSunken")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 9, 10, 9)
+        row.setSpacing(11)
+
+        self.order = label(f"{index + 1}", 12, 700, T.ACCENT)
+        self.order.setFixedWidth(18)
+        self.order.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(self.order)
+
+        glyph = _FileGlyph()
+        row.addWidget(glyph)
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(2)
+        name = label(info.name, 13, 600, T.TEXT)
+        name.setToolTip(str(info.path))
+        text_column.addWidget(name)
+        sub_color = T.DANGER if info.error else T.TEXT_SUBTLE
+        sub_text = info.error or f"{info.pages} pages  ·  {info.size_text}"
+        sub = label(sub_text, 11, 500 if info.error else 400, sub_color)
+        text_column.addWidget(sub)
+        row.addLayout(text_column, 1)
+
+        if not info.error:
+            badge = Badge(f"{info.pages} pages" if info.pages else "?")
+            row.addWidget(badge)
+        elif info.error:
+            row.addWidget(Badge("unreadable", "danger"))
+
+        self.up = icon_button("arrow_up", lambda: self._on_move(self.index, -1),
+                              "Move up", 28)
+        self.down = icon_button("arrow_down", lambda: self._on_move(self.index, 1),
+                                "Move down", 28)
+        row.addWidget(self.up)
+        row.addWidget(self.down)
+        row.addWidget(icon_button("close", self._remove, "Remove", 28, danger=True))
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.up.setEnabled(self._can_move(-1))
+        self.down.setEnabled(self._can_move(1))
+
+    def _can_move(self, delta: int) -> bool:
+        if self._on_move is None:
+            return False
+        return 0 <= self.index + delta < self._total
+
+    def _remove(self) -> None:
+        if self._on_remove:
+            self._on_remove(self.index)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.info.error:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(T.alpha(T.DANGER, 0.04))
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect().adjusted(0, 0, -1, -1)), T.RADIUS, T.RADIUS)
+        painter.drawPath(path)
+        painter.end()
+
+
+class _FileGlyph(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setFixedSize(34, 34)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0, 0, self.width(), self.height())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(T.ACCENT_SOFT))
+        painter.drawRoundedRect(rect, 9, 9)
+        T.draw_icon(painter, "file", rect.adjusted(8, 7, -8, -7), T.ACCENT, 1.6)
+        painter.end()
+
+
+class _ScrollArea(QScrollArea):
+    """Scrollable host without a visible frame or background."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+
+
+class FileList(QWidget):
+    """Ordered list of queued PDFs with move/remove controls."""
+
+    def __init__(self, on_change=None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._on_change = on_change
+        self._items: list[FileInfo] = []
+        self._scroll = _ScrollArea()
+        self._holder = QWidget()
+        self._holder.setStyleSheet("background: transparent;")
+        self._layout = QVBoxLayout(self._holder)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(8)
+        self._scroll.setWidget(self._holder)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._scroll)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(150)
+
+    def total(self) -> int:
+        return len(self._items)
+
+    def infos(self) -> list[FileInfo]:
+        return list(self._items)
+
+    def paths(self) -> list[str]:
+        return [str(i.path) for i in self._items if i.ok]
+
+    def clear(self) -> None:
+        self._items = []
+        self._rebuild()
+
+    def set_items(self, items: list[FileInfo]) -> None:
+        self._items = list(items)
+        self._rebuild()
+
+    def add_items(self, items: list[FileInfo]) -> None:
+        self._items.extend(items)
+        self._rebuild()
+
+    def remove_at(self, index: int) -> None:
+        if 0 <= index < len(self._items):
+            self._items.pop(index)
+            self._rebuild()
+
+    def move(self, index: int, delta: int) -> None:
+        target = index + delta
+        if 0 <= index < len(self._items) and 0 <= target < len(self._items):
+            self._items.insert(target, self._items.pop(index))
+            self._rebuild()
+
+    def _rebuild(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for i, info in enumerate(self._items):
+            self._layout.addWidget(
+                FileStripItem(info, i, self.remove_at, self.move, len(self._items)))
+        self._layout.addStretch(1)
+        if self._on_change:
+            self._on_change()
+
+
+# ---------------------------------------------------------------- page grid
+@dataclass
+class PageEntry:
+    index: int          # 0-based in the source document
+    rotation: int = 0   # extra rotation applied on top of the source
+    thumb: QPixmap | None = None
+    selected: bool = False
+
+
+class PageGridDelegate(QStyledItemDelegate):
+    """Paints a thumbnail card with a page badge and selection state."""
+
+    def __init__(self, owner: "PageGrid"):
+        super().__init__(owner)
+        self.owner = owner
+
+    def sizeHint(self, option, index):
+        return QSize(self.owner.card_width, self.owner.card_height)
+
+    def paint(self, painter: QPainter, option, index):
+        entry: PageEntry = index.data(Qt.ItemDataRole.UserRole)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        width, height = self.owner.card_width, self.owner.card_height
+        rect = QRectF(0, 0, width, height)
+        radius = 11.0
+        selected = entry.selected
+        hovered = index.row() == self.owner.hover_row
+
+        if selected:
+            path = QPainterPath()
+            path.addRoundedRect(rect, radius, radius)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(T.alpha(T.ACCENT, 0.07))
+            painter.drawPath(path)
+
+        border = T.ACCENT if selected else (T.BORDER_STRONG if hovered else T.BORDER)
+        painter.setBrush(QColor(T.SURFACE))
+        painter.setPen(QPen(QColor(border), 2.0 if selected else 1.2))
+        painter.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), radius, radius)
+
+        inner = rect.adjusted(8, 8, -8, -8)
+        frame = QRectF(inner.x(), inner.y(), inner.width(), inner.height() - 22)
+        painter.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(frame, 6, 6)
+        painter.setClipPath(clip)
+        if entry.thumb is not None and not entry.thumb.isNull():
+            scaled = entry.thumb.scaled(
+                QSize(int(frame.width()), int(frame.height())),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            painter.fillRect(frame, QColor("#FAFBFD"))
+            painter.drawPixmap(
+                QRectF(frame.x() + (frame.width() - scaled.width()) / 2,
+                       frame.y() + (frame.height() - scaled.height()) / 2,
+                       scaled.width(), scaled.height()),
+                scaled, QRectF(scaled.rect()))
+        else:
+            painter.fillRect(frame, QColor("#F7F8FC"))
+            ratio = QRectF(frame.x(), frame.y(), frame.width() * 0.72, frame.height() * 0.72)
+            ratio.moveCenter(frame.center())
+            painter.setPen(QPen(QColor(T.BORDER), 1.4))
+            painter.setBrush(QColor(T.SURFACE))
+            painter.drawRoundedRect(ratio, 4, 4)
+            for i in range(4):
+                y = ratio.y() + 14 + i * 9
+                if y < ratio.bottom() - 8:
+                    painter.setPen(QPen(QColor(T.BORDER), 2))
+                    painter.drawLine(QPointF(ratio.x() + 8, y), QPointF(ratio.right() - 8, y))
+        painter.restore()
+
+        if entry.rotation % 360:
+            text = f"{entry.rotation:g}°"
+            f = QFont(T.ui_font_family() or "Sans Serif")
+            f.setPixelSize(10)
+            f.setWeight(QFont.Weight(700))
+            painter.setFont(f)
+            metrics = painter.fontMetrics()
+            pill_w = metrics.horizontalAdvance(text) + 12
+            pill = QRectF(frame.right() - pill_w - 3, frame.top() + 3, pill_w, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(T.ACCENT))
+            painter.drawRoundedRect(pill, 8, 8)
+            painter.setPen(QColor(T.TEXT_ON_ACCENT))
+            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+
+        if selected:
+            check = QRectF(inner.right() - 17, inner.top() - 1, 17, 17)
+            painter.setPen(QPen(QColor(T.ACCENT), 1.4))
+            painter.setBrush(QColor(T.ACCENT))
+            painter.drawEllipse(check)
+            T.draw_icon(painter, "check", check.adjusted(3.4, 3.4, -3.4, -3.4),
+                        T.TEXT_ON_ACCENT, 2.4)
+
+        painter.setPen(QColor(T.TEXT_MUTED))
+        footer = QFont(T.ui_font_family() or "Sans Serif")
+        footer.setPixelSize(11)
+        footer.setWeight(QFont.Weight(600))
+        painter.setFont(footer)
+        text_rect = QRectF(inner.x(), frame.bottom() + 3, inner.width(), 18)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         f"Page {entry.index + 1}")
+        painter.restore()
+
+
+class PageGrid(QListWidget):
+    """Grid of page cards with rubber-band multi-select."""
+
+    selection_changed = pyqtSignal()
+    count_changed = pyqtSignal(int)
+
+    def __init__(self, on_request_thumbs=None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Strip")
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Static)
+        self.setUniformItemSizes(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setSpacing(12)
+        self.setWordWrap(False)
+        self.setMouseTracking(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setIconSize(QSize(10, 10))
+        self.card_width = 132
+        self.card_height = 178
+        self.hover_row = -1
+        self._entries: list[PageEntry] = []
+        self._on_request_thumbs = on_request_thumbs
+        self._delegate = PageGridDelegate(self)
+        self.setItemDelegate(self._delegate)
+        self._empty_state: QWidget | None = None
+
+    def set_entries(self, entries: list[PageEntry]) -> None:
+        self.clear()
+        self._entries = entries
+        for entry in entries:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setSizeHint(QSize(self.card_width + 8, self.card_height + 8))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.addItem(item)
+        self.count_changed.emit(len(entries))
+        if self._on_request_thumbs and entries:
+            self._on_request_thumbs()
+        self._sync_selection()
+
+    def entries(self) -> list[PageEntry]:
+        return self._entries
+
+    def selected(self) -> list[PageEntry]:
+        return [e for e in self._entries if e.selected]
+
+    def clear_selection(self) -> None:
+        for entry in self._entries:
+            entry.selected = False
+        self._sync_selection()
+
+    def select_all(self) -> None:
+        for entry in self._entries:
+            entry.selected = True
+        self._sync_selection()
+
+    def _sync_selection(self) -> None:
+        self.viewport().update()
+        self.selection_changed.emit()
+
+    def _row_at(self, point: QPoint) -> int:
+        item = self.itemAt(point)
+        return self.row(item) if item is not None else -1
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        row = self._row_at(event.position().toPoint())
+        if row < 0:
+            return
+        entry = self._entries[row]
+        modifiers = event.modifiers()
+        additive = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier
+                                     | Qt.KeyboardModifier.ControlModifier))
+        if not additive:
+            for other in self._entries:
+                other.selected = False
+        if entry.selected and additive:
+            entry.selected = False
+        else:
+            entry.selected = True
+        self._sync_selection()
+
+    def mouseDoubleClickEvent(self, event):
+        row = self._row_at(event.position().toPoint())
+        if row >= 0:
+            entry = self._entries[row]
+            entry.selected = not entry.selected
+            self._sync_selection()
+
+    def mouseMoveEvent(self, event):
+        row = self._row_at(event.position().toPoint())
+        if row != self.hover_row:
+            self.hover_row = row
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.hover_row = -1
+        self.viewport().update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Space:
+            row = self.currentRow()
+            if 0 <= row < len(self._entries):
+                self._entries[row].selected = not self._entries[row].selected
+                self._sync_selection()
+            return
+        if event.key() in (Qt.Key.Key_A,) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.select_all()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.clear_selection()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        columns = max(1, (self.viewport().width() - 6) // (self.card_width + 12))
+        self.setGridSize(QSize(columns * (self.card_width + 8) + 4, self.card_height + 8))
+
+
+# ---------------------------------------------------------------- feedback
+class ProgressStrip(QWidget):
+    """Slim progress bar with a status line, used under the action bar."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QProgressBar
+
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(7)
+        row = QHBoxLayout()
+        row.setSpacing(9)
+        self.message = label("Ready", 12, 500, T.TEXT_MUTED)
+        row.addWidget(self.message, 1)
+        self.percent = label("0%", 12, 600, T.ACCENT)
+        row.addWidget(self.percent)
+        column.addLayout(row)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
+        column.addWidget(self.bar)
+        self.hide()
+
+        self._effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._effect)
+        self._effect.setOpacity(1.0)
+        self._anim = QPropertyAnimation(self._effect, b"opacity", self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def start(self, message: str = "Working") -> None:
+        self.message.setText(message)
+        self.percent.setText("0%")
+        self.bar.setValue(0)
+        self.show()
+        self._anim.stop()
+        self._effect.setOpacity(1.0)
+
+    def update_progress(self, percent: int, message: str = "") -> None:
+        self.bar.setValue(max(0, min(100, int(percent))))
+        self.percent.setText(f"{int(percent)}%")
+        if message:
+            self.message.setText(message)
+
+    def finish(self, message: str = "Done", success: bool = True) -> None:
+        self.bar.setValue(100)
+        self.percent.setText("100%")
+        self.message.setText(message)
+        self.message.setStyleSheet(f"color: {T.SUCCESS if success else T.DANGER};")
+
+
+class Toast(QFrame):
+    """Floating notification card."""
+
+    closed = pyqtSignal()
+
+    KINDS = {
+        "success": (T.SUCCESS, T.SUCCESS_SOFT, "check"),
+        "error": (T.DANGER, T.DANGER_SOFT, "alert"),
+        "info": (T.ACCENT, T.ACCENT_SOFT, "info"),
+        "warning": (T.WARNING, T.WARNING_SOFT, "alert"),
+    }
+
+    def __init__(self, title: str, message: str = "", kind: str = "info",
+                 duration: int = 4200, parent: QWidget | None = None):
+        super().__init__(parent)
+        accent, soft, icon = self.KINDS.get(kind, self.KINDS["info"])
+        self.setObjectName("Toast")
+        self.setFixedWidth(392)
+        soft_shadow(self, blur=34, dy=10, alpha=0.14)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 13, 12, 13)
+        row.setSpacing(11)
+
+        badge = _IconBadge(icon, 30, tone=(soft, accent))
+        row.addWidget(badge)
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(2)
+        title_label = label(title, 13, 600, T.TEXT)
+        text_column.addWidget(title_label)
+        if message:
+            body = label(message, 12, 400, T.TEXT_MUTED)
+            body.setWordWrap(True)
+            text_column.addWidget(body)
+        row.addLayout(text_column, 1)
+        row.addWidget(icon_button("close", self.dismiss, "Dismiss", 26))
+
+        self.setStyleSheet(
+            f"QFrame#Toast{{background: {T.SURFACE}; border: 1px solid {T.BORDER};"
+            f" border-radius: {T.RADIUS}px;}}")
+        self._accent = accent
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        if duration:
+            self._timer.start(duration)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self._accent))
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, 4, self.height()), 2, 2)
+        painter.drawPath(path)
+        painter.end()
+
+    def dismiss(self) -> None:
+        self.closed.emit()
+        self.deleteLater()
+
+
+class ToastHost(QWidget):
+    """Stacks toasts in the bottom-right corner of its parent window."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._column = QVBoxLayout(self)
+        self._column.setContentsMargins(0, 0, 0, 0)
+        self._column.setSpacing(10)
+        self._column.addStretch(1)
+        self.setFixedWidth(392)
+        self._live: list[Toast] = []
+
+    def notify(self, title: str, message: str = "", kind: str = "info",
+               duration: int = 4200) -> Toast:
+        while len(self._live) >= 3:
+            self._live.pop(0).dismiss()
+        toast = Toast(title, message, kind, duration, self)
+        self._live.append(toast)
+        self._column.addWidget(toast)
+        toast.closed.connect(lambda t=toast: self._forget(t))
+        self._reposition()
+        QTimer.singleShot(0, self._reposition)
+        return toast
+
+    def _forget(self, toast: Toast) -> None:
+        if toast in self._live:
+            self._live.remove(toast)
+        self._reposition()
+
+    def _reposition(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        height = self.sizeHint().height()
+        self.setGeometry(parent.width() - self.width() - 26,
+                         parent.height() - height - 24,
+                         self.width(), height)
+        self.raise_()
+
+
+class ResultCard(Card):
+    """Success panel shown after a job finishes."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent, pad=18)
+        self.setVisible(False)
+        row = QHBoxLayout()
+        row.setSpacing(13)
+        self.glyph = _IconBadge("check", 38)
+        row.addWidget(self.glyph)
+        column = QVBoxLayout()
+        column.setSpacing(3)
+        self.title = label("Done", 14, 700, T.TEXT)
+        column.addWidget(self.title)
+        self.detail = label("", 12, 400, T.TEXT_MUTED)
+        self.detail.setWordWrap(True)
+        column.addWidget(self.detail)
+        row.addLayout(column, 1)
+        self.stats = QVBoxLayout()
+        self.stats.setSpacing(5)
+        self.stats.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.size_badge = Badge("", "success")
+        self.stats.addWidget(self.size_badge)
+        self.open_button = soft_button("Open", "arrow_right", self._open)
+        self.stats.addWidget(self.open_button)
+        row.addLayout(self.stats)
+        self.add_layout(row)
+        self._path: Path | None = None
+
+    def show_result(self, title: str, detail: str, size_text: str, saved: int,
+                    path: Path) -> None:
+        self.title.setText(title)
+        self.detail.setText(detail)
+        tone = "success" if saved > 0 else "neutral"
+        self.size_badge.set_tone(tone)
+        self.size_badge.setText(f"{size_text}  ·  -{saved}%" if saved > 0 else size_text)
+        self._path = path
+        self.setVisible(True)
+        self.adjustSize()
+
+    def hide_result(self) -> None:
+        self.setVisible(False)
+        self._path = None
+
+    def _open(self) -> None:
+        if self._path is None:
+            return
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        if not self._path.exists() and self._path.parent.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path.parent)))
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path)))
