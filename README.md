@@ -48,7 +48,7 @@ different one — no re-uploading, no re-picking.
 | **Split** | Extract a page range, or cut into chunks of N pages |
 | **Compress** | Three levels, each reported with the size actually saved |
 | **Rotate** | All pages or a chosen range, 90/180/270° |
-| **Organise** | Visual page grid — delete, rotate, duplicate, reorder |
+| **Organise** | Visual page grid — reorder by dragging, delete, rotate, duplicate, and add image files as new pages |
 | **Protect** | Add an open password, optionally blocking print and copy |
 | **Metadata** | Title, author, subject and keywords |
 
@@ -56,6 +56,30 @@ Output names are filled in for you (`notes.pdf` → `notes_compressed.pdf`), so
 switching files updates the target too. `Ctrl+1` … `Ctrl+7` switch tools,
 `Ctrl+Q` quits. Long jobs run on a background thread with a progress bar, so the
 window stays responsive.
+
+### Organise: build the page order by hand
+
+Organise shows every page of whichever file is selected in the top bar as a
+thumbnail, and the order on screen is the order you get in the saved file.
+
+- **Select** — click a card, `Ctrl+click` or `Shift+click` to add more, `Ctrl+A`
+  for all, `Esc` to clear.
+- **Delete** — select the pages you do not want, then the bin button.
+- **Reorder** — press a card and drag it. A dashed marker shows where it will
+  land; the grid scrolls if you drag towards the edge. The arrow buttons do the
+  same thing a page at a time.
+- **Rotate / duplicate** — act on everything currently selected.
+- **Add images** — drop `.png`, `.jpg`, `.webp`, `.tif` and similar files
+  anywhere on the grid and they become new pages, inserted where you dropped
+  them. They are marked `IMG` and captioned with the file name, and you can
+  reorder, rotate and delete them like any other page.
+- Images are fitted onto an A4 page keeping their aspect ratio, never blown up
+  beyond their real resolution, and transparent areas are flattened onto white.
+  Photo EXIF orientation is respected. You can build a PDF from images alone,
+  with no source file selected.
+
+Dropping PDFs still adds them to the shared bar in the top left, so mixing files
+in and dropping images on the grid can both happen in one session.
 
 ## Command line
 

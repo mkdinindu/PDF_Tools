@@ -25,6 +25,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFontMetrics,
     QGuiApplication,
+    QImage,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -127,18 +128,19 @@ class Thumbnailer(QRunnable):
 
     _cache: dict[tuple, str] = {}
 
-    def __init__(self, path: str, index: int, width: int, signals: ThumbSignals,
-                 generation: int):
+    def __init__(self, path: str, index: int, row: int, width: int,
+                 signals: ThumbSignals, generation: int):
         super().__init__()
         self.path = path
         self.index = index
+        self.row = row
         self.width = width
         self.signals = signals
         self.generation = generation
 
     @staticmethod
-    def _key(path: str, index: int, width: int, mtime: float, size: int) -> tuple:
-        return (path, index, width, mtime, size)
+    def _key(path: str, index: int, width: int, mtime: float, size: int, generation: int) -> tuple:
+        return (path, index, width, mtime, size, generation)
 
     def run(self):
         if QGuiApplication.instance() is None:
@@ -147,21 +149,21 @@ class Thumbnailer(QRunnable):
             stat = os.stat(self.path)
         except OSError:
             return
-        key = self._key(self.path, self.index, self.width, stat.st_mtime, stat.st_size)
+        key = self._key(self.path, self.index, self.width, stat.st_mtime, stat.st_size, self.generation)
         cache_dir = Path(tempfile.gettempdir()) / "pdf-tools-thumbs"
         cache_file = cache_dir / (f"{abs(hash(key))}.png")
         if cache_file.exists():
             try:
                 pixmap = QPixmap(str(cache_file))
                 if not pixmap.isNull():
-                    self.signals.ready.emit(self.index, pixmap)
+                    self.signals.ready.emit(self.row, pixmap)
                     return
             except Exception:  # noqa: BLE001
                 pass
 
         gs = core.ghostscript_path()
         if not gs:
-            self.signals.ready.emit(self.index, None)
+            self.signals.ready.emit(self.row, None)
             return
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -182,8 +184,60 @@ class Thumbnailer(QRunnable):
         pixmap = QPixmap(str(cache_file)) if cache_file.exists() else None
         if pixmap is not None and pixmap.isNull():
             pixmap = None
-        self.signals.ready.emit(self.index, pixmap)
+        self.signals.ready.emit(self.row, pixmap)
 
+
+class ImageThumb(QRunnable):
+    """Renders a dropped image file to a QImage for its grid card.
+
+    Uses QImage rather than QPixmap because pixmaps may only be built on the
+    GUI thread; the result is converted in :meth:`ToolPanel._apply_thumb`.
+    """
+
+    def __init__(self, path: str, row: int, width: int, signals: ThumbSignals,
+                 generation: int):
+        super().__init__()
+        self.path = path
+        self.row = row
+        self.width = width
+        self.signals = signals
+        self.generation = generation
+
+    def run(self):
+        if QGuiApplication.instance() is None:
+            return
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            return
+        key = (self.path, self.width, stat.st_mtime, stat.st_size, self.generation)
+        cache_dir = Path(tempfile.gettempdir()) / "pdf-tools-thumbs"
+        cache_file = cache_dir / f"img-{abs(hash(key))}.png"
+        if cache_file.exists():
+            try:
+                cached = QImage(str(cache_file))
+                if not cached.isNull():
+                    self.signals.ready.emit(self.row, cached)
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            image = QImage(self.path)
+            if image.isNull():
+                self.signals.ready.emit(self.row, None)
+                return
+            # honour EXIF orientation so photos are not shown sideways
+            if not image.isNull() and hasattr(image, "setAutoTransform"):
+                image.setAutoTransform(True)
+            scaled = image.scaledToWidth(
+                max(48, self.width * 3),
+                Qt.TransformationMode.SmoothTransformation)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            scaled.save(str(cache_file), "PNG")
+        except Exception:  # noqa: BLE001
+            self.signals.ready.emit(self.row, None)
+            return
+        self.signals.ready.emit(self.row, scaled)
 
 # ------------------------------------------------------------ source bar
 class SourceBar(QWidget):
@@ -440,6 +494,7 @@ class ToolPanel(QWidget):
         super().__init__()
         self.window = window
         self._jobs: list[Job] = []
+        self._thumb_generation = 0
         self.setAcceptDrops(True)
         window.source.current_changed.connect(self._on_source)
 
@@ -499,19 +554,36 @@ class ToolPanel(QWidget):
         job.signals.failed.connect(bad)
         QThreadPool.globalInstance().start(job)
 
-    def load_thumbs(self, grid: PageGrid, path: str, count: int) -> None:
-        signals = ThumbSignals()
-        signals.ready.connect(partial(self._apply_thumb, grid, path, count))
-        pool = QThreadPool.globalInstance()
-        for i in range(count):
-            pool.start(Thumbnailer(path, i, grid.card_width, signals, id(grid)))
-
-    def _apply_thumb(self, grid: PageGrid, path: str, count: int, index: int, pixmap) -> None:
-        info = self.info
-        if info is not None and str(info.path) != path:
+    # -- helpers used by subclasses -------------------------------------
+    def load_entry_thumbs(self, grid: PageGrid, path: str | None,
+                          entries: list[PageEntry], generation: int = 0) -> None:
+        """Request one thumbnail per card, PDF pages and dropped images alike."""
+        if not entries:
             return
+        signals = ThumbSignals()
+        signals.ready.connect(partial(self._apply_thumb, grid, path, len(entries), generation))
+        pool = QThreadPool.globalInstance()
+        for row, entry in enumerate(entries):
+            if entry.is_image:
+                pool.start(ImageThumb(str(entry.image), row, grid.card_width,
+                                      signals, generation))
+            elif path:
+                pool.start(Thumbnailer(path, entry.index, row, grid.card_width,
+                                       signals, generation))
+
+    def _apply_thumb(self, grid: PageGrid, path: str | None, count: int,
+                     generation: int, index: int, pixmap) -> None:
+        if generation != self._thumb_generation:
+            return
+        info = self.info
+        if info is not None and path and str(info.path) != path:
+            return
+        if isinstance(pixmap, QImage):
+            if pixmap.isNull():
+                return
+            pixmap = QPixmap.fromImage(pixmap)
         entries = grid.entries()
-        if index < len(entries) and pixmap is not None:
+        if 0 <= index < len(entries) and pixmap is not None and not pixmap.isNull():
             entries[index].thumb = pixmap
             item = grid.item(index)
             if item is not None:
@@ -1065,8 +1137,8 @@ class OrganizePanel(ToolPanel):
         layout.addWidget(self.using)
 
         self.card = Card(pad=18)
-        header = SectionHeader("Pages", "Click to select, Ctrl+click for more. "
-                                        "Then delete, rotate or duplicate.")
+        header = SectionHeader("Pages", "Drag to reorder  ·  drag images in to add pages  "
+                                        "·  click to select")
         select_all = ghost_button("Select all", "check", lambda: self.grid.select_all())
         clear_sel = ghost_button("Clear", "close", lambda: self.grid.clear_selection())
         header.add_action(clear_sel)
@@ -1090,9 +1162,12 @@ class OrganizePanel(ToolPanel):
         toolbar.addWidget(icon_button("trash", self._delete_selected, "Delete", danger=True))
         self.card.add_layout(toolbar)
 
-        self.grid = PageGrid(on_request_thumbs=self._thumbs_wanted)
+        self.grid = PageGrid(on_request_thumbs=self._thumbs_wanted,
+                             image_suffixes=core.IMAGE_SUFFIXES)
         self.grid.selection_changed.connect(self._sync)
         self.grid.count_changed.connect(lambda _: self._sync())
+        self.grid.reorder_moved.connect(self._on_reorder)
+        self.grid.images_dropped.connect(self._add_images)
         self.card.add(self.grid, 1)
         self.grid.setMinimumHeight(300)
         layout.addWidget(self.card, 1)
@@ -1134,16 +1209,78 @@ class OrganizePanel(ToolPanel):
             self.entries = []
             self.grid.set_entries([])
             return
+        self._thumb_generation += 1
         self.total = info.pages
         self.output.set_text(f"{Path(info.path).stem}_edited.pdf")
         self.entries = [PageEntry(index=i) for i in range(info.pages)]
         self.grid.set_entries(self.entries)
         self.window.progress.start("Rendering page previews")
         self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
+
     def _thumbs_wanted(self):
-        if self.paths and self.entries:
-            self.window.progress.start("Rendering page previews")
-            self.load_thumbs(self.grid, self.paths[0], len(self.entries))
+        if not self.entries:
+            return
+        source = self.paths[0] if self.paths else None
+        if source is None and not any(e.is_image for e in self.entries):
+            return
+        self.window.progress.start("Rendering page previews")
+        self.load_entry_thumbs(self.grid, source, self.entries, self._thumb_generation)
+
+    # -- dropping images -------------------------------------------------
+    def accept_paths(self, paths) -> None:
+        """Images become new pages here; PDFs still feed the shared source."""
+        images, others = core.split_images(paths)
+        if images:
+            self._add_images(images, len(self.entries))
+        if others:
+            self.window.source.add_paths(others)
+
+    def dropEvent(self, event):
+        """Drops on the grid slot images in where the cursor is aiming."""
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            return
+        images, others = core.split_images(paths)
+        if images:
+            viewport = self.grid.viewport()
+            here = event.position().toPoint()
+            inside = viewport.geometry().contains(here)
+            at = self.grid.slot_for_point(viewport.mapFrom(self, here)) if inside \
+                else len(self.entries)
+            self._add_images(images, at)
+        if others:
+            self.window.settings.setValue("last_dir", str(Path(others[0]).parent))
+            self.window.source.add_paths(others)
+        if images or others:
+            event.acceptProposedAction()
+
+    def _add_images(self, images, at: int | None = None) -> None:
+        existing = {e.image for e in self.entries if e.image is not None}
+        fresh = [p for p in images if p not in existing]
+        if not fresh:
+            self.window.toasts.notify("Already added", "Those images are already in the grid",
+                                      "warning")
+            return
+        entries = [PageEntry(index=0, image=path) for path in fresh]
+        position = len(self.entries) if at is None else max(0, min(int(at), len(self.entries)))
+        if not self.entries:
+            self.total = 0
+        self.grid.insert_entries(entries, position)
+        self.entries = self.grid.entries()
+        self._sync()
+        self._thumbs_wanted()
+        self.window.toasts.notify(
+            f"Added {len(entries)} image{'s' if len(entries) > 1 else ''}",
+            "Drag to place them, then save", "success")
+
+    def _on_reorder(self, source: int, target: int) -> None:
+        entries = self.entries
+        if not (0 <= source < len(entries)) or not (0 <= target < len(entries)):
+            return
+        entry = entries.pop(source)
+        entries.insert(target, entry)
+        self.grid.relayout()
+        self._sync()
 
     def _selected(self) -> list[PageEntry]:
         return [e for e in self.entries if e.selected]
@@ -1166,7 +1303,8 @@ class OrganizePanel(ToolPanel):
             for other in chosen:
                 entry.selected = False
         for entry in reversed(chosen):
-            clone = PageEntry(index=entry.index, rotation=entry.rotation, thumb=entry.thumb)
+            clone = PageEntry(index=entry.index, rotation=entry.rotation,
+                              thumb=entry.thumb, image=entry.image)
             self.entries.insert(self.entries.index(entry) + 1, clone)
         self._refresh()
 
@@ -1199,8 +1337,14 @@ class OrganizePanel(ToolPanel):
 
     def _refresh(self):
         if not self.entries:
-            self.window.toasts.notify("Nothing left", "Keep at least one page", "error")
-            self.entries = [PageEntry(index=i) for i in range(max(1, self.total))]
+            if self.info is not None:
+                self.entries = [PageEntry(index=i) for i in range(max(1, self.total))]
+            else:
+                self.window.toasts.notify("Nothing left", "Drop in some images to continue",
+                                          "warning")
+                self.grid.set_entries([])
+                self._sync()
+                return
         self.grid.set_entries(self.entries)
         self._sync()
 
@@ -1208,19 +1352,28 @@ class OrganizePanel(ToolPanel):
         count = len(self._selected()) if self.entries else 0
         self.selection_badge.setText(f"{count} selected" if count else "Nothing selected")
         self.selection_badge.set_tone("accent" if count else "neutral")
-        has = self.info is not None and bool(self.entries)
+        has = bool(self.entries)
         self.action.setEnabled(has)
         self.output.setEnabled(has)
-        if has:
+        images = sum(1 for e in self.entries if e.is_image)
+        if has and images:
             self.action.setText(f"Save {len(self.entries)} pages")
+            self.using.set_detail(f"{len(self.entries)} pages  ·  {images} from images")
+        elif has:
+            self.action.setText(f"Save {len(self.entries)} pages")
+        else:
+            self.action.setText(self.action_label)
 
     def _run(self):
-        if not self.paths or not self.entries:
+        if not self.entries:
             return
-        order = [e.index for e in self.entries]
+        order = [e.image if e.is_image else e.index for e in self.entries]
         turns = [e.rotation for e in self.entries]
+        source = self.paths[0] if self.paths else None
+        if source is None:
+            self.output.set_text(self.output.text() or "images.pdf")
         self.result.hide_result()
-        self.run_job(core.rebuild_pdf, self.paths[0], self.output.text(), order,
+        self.run_job(core.rebuild_pdf, source, self.output.text(), order,
                      title="Saved", on_done=self._on_done, rotations=turns)
 
     def _on_done(self, result):
@@ -1503,7 +1656,7 @@ class MainWindow(QWidget):
         self.stack_host.setObjectName("Root")
         host_layout = QVBoxLayout(self.stack_host)
         host_layout.setContentsMargins(0, 0, 0, 0)
-        host_layout.addWidget(self.stack)
+        host_layout.addWidget(self.stack, 1)
         scroll.setWidget(self.stack_host)
         body_layout.addWidget(scroll, 1)
         root.addWidget(body, 1)

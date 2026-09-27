@@ -32,6 +32,15 @@ COMPRESSION_PRESETS: dict[str, dict] = {
              "hint": "Smallest file, lower image detail"},
 }
 
+#: Image types the GUI accepts as drop-ins that become PDF pages.
+IMAGE_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".bmp", ".gif", ".tif", ".tiff",
+    ".webp", ".ppm", ".pgm", ".pnm", ".pbm",
+})
+
+#: Page size in points, used to fit dropped images onto a sheet.
+A4_POINTS = (595.0, 842.0)
+
 META_FIELDS = ("/Title", "/Author", "/Subject", "/Keywords", "/Creator")
 
 METRIC_KEYS = META_FIELDS + ("/Producer", "/CreatorDate")
@@ -193,17 +202,19 @@ def _resolve_output(output: str | os.PathLike, fallback_stem: str) -> Path:
     return out.absolute()
 
 
-def _derived_output(requested: str | os.PathLike, src: Path, tag: str) -> Path:
+def _derived_output(requested: str | os.PathLike, src: Path | None, tag: str) -> Path:
     """Output path for derived output, refusing to silently overwrite the input."""
     raw = str(requested).strip() if requested is not None else ""
     if not raw:
+        if src is None:
+            return Path.cwd() / f"{tag}.pdf"
         return src.with_name(f"{src.stem}_{tag}.pdf")
     out = Path(raw).expanduser()
     if not out.suffix:
         out = out.with_suffix(".pdf")
-    if out.absolute() == src.absolute():
+    if src is not None and out.absolute() == src.absolute():
         return src.with_name(f"{src.stem}_{tag}.pdf")
-    return _resolve_output(out, src.stem)
+    return _resolve_output(out, src.stem if src is not None else out.stem)
 
 
 def _copy_metadata(reader: PdfReader, writer: PdfWriter) -> None:
@@ -222,6 +233,51 @@ def _copy_metadata(reader: PdfReader, writer: PdfWriter) -> None:
             writer.add_metadata(clean)
         except Exception:  # noqa: BLE001
             pass
+
+
+def split_images(paths: Iterable[str | os.PathLike]) -> tuple[list[Path], list[Path]]:
+    """Split dropped paths into (images, everything else)."""
+    images: list[Path] = []
+    others: list[Path] = []
+    for raw in paths:
+        path = Path(str(raw))
+        (images if path.suffix.lower() in IMAGE_SUFFIXES else others).append(path)
+    return images, others
+
+
+def image_page(path: str | os.PathLike):
+    """Build a one-page PDF page from an image, fitted to A4 keeping aspect."""
+    from PIL import Image, ImageOps
+
+    p = Path(str(path))
+    try:
+        with Image.open(p) as handle:
+            handle.seek(0)
+            # honour the EXIF orientation flag so phone photos are not sideways
+            image = ImageOps.exif_transpose(handle)
+            if image.mode in ("RGBA", "LA", "P"):
+                flat = Image.new("RGB", image.size, (255, 255, 255))
+                rgba = image.convert("RGBA")
+                flat.paste(rgba, mask=rgba.split()[-1])
+                image = flat
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            width, height = image.size
+            sheet_w, sheet_h = A4_POINTS
+            # never magnify past 1 pixel per point (72 dpi) to keep it sharp
+            scale = min(sheet_w / max(1, width), sheet_h / max(1, height), 1.0)
+            # Pillow sets page points = pixels * 72 / resolution
+            buffer = BytesIO()
+            image.save(buffer, "PDF", resolution=72.0 / scale)
+    except PdfToolError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise PdfToolError(f"{p.name} could not be read as an image") from exc
+    buffer.seek(0)
+    try:
+        return PdfReader(buffer).pages[0]
+    except Exception as exc:  # noqa: BLE001
+        raise PdfToolError(f"{p.name} could not be converted to a page") from exc
 
 
 def _write(writer: PdfWriter, output: Path) -> None:
@@ -571,45 +627,78 @@ def rotate_pdf(input_path: str | os.PathLike, output_path: str | os.PathLike,
                      detail=f"{len(targets)} page(s) turned {angle}deg ({scope})")
 
 
-def rebuild_pdf(input_path: str | os.PathLike, output_path: str | os.PathLike,
-                order: Sequence[int], progress: ProgressFn = noop_progress,
+def rebuild_pdf(input_path: str | os.PathLike | None, output_path: str | os.PathLike,
+                order: Sequence[int | str | os.PathLike], progress: ProgressFn = noop_progress,
                 rotations: Sequence[int] | None = None) -> JobResult:
-    """Write a new PDF from a custom page order. ``order`` is 0-based indexes.
+    """Write a new PDF from a custom page order.
 
-    Repeated indexes duplicate a page. ``rotations`` gives a clockwise turn in
-    degrees for each entry of ``order`` and defaults to no rotation.
+    ``order`` drives the output: each entry is either a 0-based page index into
+    the source PDF, or a path to an image file which becomes a new page.
+    Repeated indexes duplicate a page, and ``rotations`` gives a clockwise turn
+    in degrees per entry. ``input_path`` may be ``None`` when every page comes
+    from an image.
     """
-    src = Path(str(input_path)).expanduser()
-    if not src.exists():
+    src = Path(str(input_path)).expanduser() if input_path else None
+    if src is not None and not src.exists():
         raise PdfToolError("Select a PDF first")
+    if src is not None and src.absolute() == _as_path(output_path).absolute():
+        raise PdfToolError("Pick a different name - that would overwrite the original")
     out = _derived_output(output_path, src, "edited")
-    reader = _read_any(src)
-    total = len(reader.pages)
+    reader = _read_any(src) if src is not None else None
+    total = len(reader.pages) if reader is not None else 0
+
     turns = list(rotations) if rotations is not None else []
     turns += [0] * (len(order) - len(turns))
-    sequence = [(int(i), int(turns[n]) % 360) for n, i in enumerate(order)
-                if 0 <= int(i) < total]
+    # normalise to (kind, value, turn) so a bad entry is dropped, not fatal
+    sequence: list[tuple[str, object, int]] = []
+    for n, entry in enumerate(order):
+        turn = int(turns[n]) % 360
+        if isinstance(entry, (str, os.PathLike)) and not isinstance(entry, int):
+            image = Path(str(entry))
+            if image.exists() and image.suffix.lower() in IMAGE_SUFFIXES:
+                sequence.append(("image", image, turn))
+        else:
+            idx = int(entry)
+            if reader is not None and 0 <= idx < total:
+                sequence.append(("page", idx, turn))
     if not sequence:
         raise PdfToolError("Keep at least one page")
 
     writer = PdfWriter()
-    _copy_metadata(reader, writer)
-    for n, (idx, turn) in enumerate(sequence):
-        writer.add_page(reader.pages[idx])
+    if reader is not None:
+        _copy_metadata(reader, writer)
+    for n, (kind, value, turn) in enumerate(sequence):
+        if kind == "page":
+            writer.add_page(reader.pages[int(value)])
+            where = f"page {int(value) + 1}"
+        else:
+            writer.add_page(image_page(value))
+            where = f"image {Path(str(value)).name}"
         if turn:
             writer.pages[-1].rotate(turn)
-        progress(5 + int((n + 1) / len(sequence) * 90), f"Writing page {idx + 1}")
+        progress(5 + int((n + 1) / len(sequence) * 90), f"Writing {where}")
     _write(writer, out)
-    kept = len({idx for idx, _ in sequence})
+
+    indexes = [int(v) for k, v, _ in sequence if k == "page"]
+    images = sum(1 for k, _, _ in sequence if k == "image")
     parts = [f"{len(sequence)} pages written"]
-    if len(sequence) > kept:
-        parts.append(f"{len(sequence) - kept} duplicated")
-    if total - kept:
-        parts.append(f"{total - kept} removed")
-    if [idx for idx, _ in sequence] != sorted({idx for idx, _ in sequence}):
-        parts.append("reordered")
-    return JobResult(out, len(sequence), src.stat().st_size, out.stat().st_size,
+    if images:
+        parts.append(f"{images} from image{'s' if images > 1 else ''}")
+    if indexes and len(indexes) > len(set(indexes)):
+        parts.append(f"{len(indexes) - len(set(indexes))} duplicated")
+    if reader is not None:
+        kept = len(set(indexes))
+        if total - kept:
+            parts.append(f"{total - kept} removed")
+        if indexes != sorted(set(indexes)):
+            parts.append("reordered")
+    before = src.stat().st_size if src is not None else 0
+    return JobResult(out, len(sequence), before, out.stat().st_size,
                      detail=", ".join(parts))
+
+
+def _as_path(value: str | os.PathLike) -> Path:
+    return Path(str(value)).expanduser()
 
 
 def edit_metadata(input_path: str | os.PathLike, output_path: str | os.PathLike,

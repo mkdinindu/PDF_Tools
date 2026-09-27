@@ -34,6 +34,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
@@ -164,6 +165,7 @@ class Button(QPushButton):
         super().__init__(text, parent)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.variant = variant
+        self._icon_key = icon
         roles = {"primary": "Primary", "accent": "Accent", "soft": "Soft",
                  "danger": "Danger", "ghost": "Ghost", "icon": "IconButton"}
         self.setObjectName(roles.get(variant, ""))
@@ -698,6 +700,10 @@ class PageGridDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index):
         entry: PageEntry = index.data(Qt.ItemDataRole.UserRole)
         painter.save()
+        # option.rect is where Qt actually wants this card drawn in the
+        # viewport; every local coordinate below is relative to (0, 0), so
+        # without this translate every card paints on top of the first one.
+        painter.translate(option.rect.topLeft())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         width, height = self.owner.card_width, self.owner.card_height
@@ -714,8 +720,15 @@ class PageGridDelegate(QStyledItemDelegate):
             painter.drawPath(path)
 
         border = T.ACCENT if selected else (T.BORDER_STRONG if hovered else T.BORDER)
+        width = 2.0 if selected else 1.2
+        style = Qt.PenStyle.SolidLine
+        if index.row() == self.owner.drag_row:
+            # the card being dragged right now
+            border, width, style = T.ACCENT, 2.0, Qt.PenStyle.DashLine
         painter.setBrush(QColor(T.SURFACE))
-        painter.setPen(QPen(QColor(border), 2.0 if selected else 1.2))
+        pen = QPen(QColor(border), width)
+        pen.setStyle(style)
+        painter.setPen(pen)
         painter.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), radius, radius)
 
         inner = rect.adjusted(8, 8, -8, -8)
@@ -749,6 +762,21 @@ class PageGridDelegate(QStyledItemDelegate):
                     painter.drawLine(QPointF(ratio.x() + 8, y), QPointF(ratio.right() - 8, y))
         painter.restore()
 
+        if entry.is_image:
+            text = "IMG"
+            f = QFont(T.ui_font_family() or "Sans Serif")
+            f.setPixelSize(10)
+            f.setWeight(QFont.Weight(700))
+            painter.setFont(f)
+            metrics = painter.fontMetrics()
+            pill_w = metrics.horizontalAdvance(text) + 12
+            pill = QRectF(frame.left() + 3, frame.top() + 3, pill_w, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(T.TEXT_MUTED))
+            painter.drawRoundedRect(pill, 8, 8)
+            painter.setPen(QColor(T.SURFACE))
+            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+
         if entry.rotation % 360:
             text = f"{entry.rotation:g}°"
             f = QFont(T.ui_font_family() or "Sans Serif")
@@ -779,27 +807,46 @@ class PageGridDelegate(QStyledItemDelegate):
         painter.setFont(footer)
         text_rect = QRectF(inner.x(), frame.bottom() + 3, inner.width(), 18)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         f"Page {entry.index + 1}")
+                         entry.caption())
         painter.restore()
 
 
-@dataclass
+@dataclass(eq=False)
 class PageEntry:
-    """One page in the organise grid."""
+    """One card in the organise grid.
+
+    Either a page of the source PDF (``index``) or a dropped image file
+    (``image``), which becomes a brand new page when the tool saves.
+    """
 
     index: int
     rotation: int = 0
     thumb: QPixmap | None = None
     selected: bool = False
+    image: Path | None = None
+
+    @property
+    def is_image(self) -> bool:
+        return self.image is not None
+
+    def caption(self) -> str:
+        if self.image is not None:
+            name = self.image.name
+            return name if len(name) <= 20 else name[:18] + "…"
+        return f"Page {self.index + 1}"
 
 
 class PageGrid(QListWidget):
-    """Grid of page cards with rubber-band multi-select."""
+    """Grid of page cards: click to select, drag to reorder, drop images in."""
 
     selection_changed = pyqtSignal()
     count_changed = pyqtSignal(int)
+    reorder_moved = pyqtSignal(int, int)
+    images_dropped = pyqtSignal(list, int)
+    drag_state = pyqtSignal(str)
 
-    def __init__(self, on_request_thumbs=None, parent: QWidget | None = None):
+    def __init__(self, on_request_thumbs=None, image_suffixes=frozenset(),
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Strip")
         self.setViewMode(QListView.ViewMode.IconMode)
@@ -817,23 +864,60 @@ class PageGrid(QListWidget):
         self.card_width = 132
         self.card_height = 178
         self.hover_row = -1
+        self.drag_row = -1
         self._entries: list[PageEntry] = []
         self._on_request_thumbs = on_request_thumbs
+        self._image_suffixes = {s.lower() for s in image_suffixes}
+        self._press_point: QPoint | None = None
+        self._press_screen: QPoint | None = None
+        self._press_row = -1
+        self._drop_slot = -1
+        self._after_flag = False
         self._delegate = PageGridDelegate(self)
         self.setItemDelegate(self._delegate)
+        self.setGridSize(self.cell_size())
         self._empty_state: QWidget | None = None
+        self.setAcceptDrops(bool(self._image_suffixes))
+        if self._image_suffixes:
+            self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
 
     def set_entries(self, entries: list[PageEntry]) -> None:
         self.clear()
         self._entries = entries
         for entry in entries:
+            self._append_item(entry)
+        self.count_changed.emit(len(entries))
+        if self._on_request_thumbs and entries:
+            self._on_request_thumbs()
+        self._sync_selection()
+
+    def _append_item(self, entry: PageEntry) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        item.setSizeHint(QSize(self.card_width + 8, self.card_height + 8))
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        self.addItem(item)
+
+    def relayout(self) -> None:
+        """Re-bind cards to the current entry order without reloading thumbs."""
+        for row, entry in enumerate(self._entries):
+            item = self.item(row)
+            if item is not None:
+                item.setData(Qt.ItemDataRole.UserRole, entry)
+        self.viewport().update()
+
+    def insert_entries(self, entries: list[PageEntry], at: int) -> None:
+        """Splice new cards in at ``at`` and ask for their thumbnails."""
+        at = max(0, min(int(at), len(self._entries)))
+        for offset, entry in enumerate(entries):
+            self._entries.insert(at + offset, entry)
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, entry)
             item.setSizeHint(QSize(self.card_width + 8, self.card_height + 8))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.addItem(item)
-        self.count_changed.emit(len(entries))
-        if self._on_request_thumbs and entries:
+            self.insertItem(at + offset, item)
+        self.count_changed.emit(len(self._entries))
+        if self._on_request_thumbs:
             self._on_request_thumbs()
         self._sync_selection()
 
@@ -864,7 +948,11 @@ class PageGrid(QListWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
-        row = self._row_at(event.position().toPoint())
+        point = event.position().toPoint()
+        row = self._row_at(point)
+        self._press_point = point
+        self._press_screen = event.globalPosition().toPoint()
+        self._press_row = row
         if row < 0:
             return
         entry = self._entries[row]
@@ -888,11 +976,177 @@ class PageGrid(QListWidget):
             self._sync_selection()
 
     def mouseMoveEvent(self, event):
-        row = self._row_at(event.position().toPoint())
+        point = event.position().toPoint()
+        row = self._row_at(point)
         if row != self.hover_row:
             self.hover_row = row
             self.viewport().update()
+        if self.drag_row < 0 and self._press_row >= 0 and self._press_screen is not None:
+            moved = event.globalPosition().toPoint() - self._press_screen
+            if moved.manhattanLength() >= QApplication.startDragDistance():
+                self.drag_row = self._press_row
+                self._drop_slot = self._press_row
+        if self.drag_row >= 0:
+            self._drop_slot = self._slot_at(point)
+            self._autoscroll(point)
+            self._announce_drag()
+            self.viewport().update()
+            return
         super().mouseMoveEvent(event)
+
+    def _announce_drag(self) -> None:
+        """Tell the panel exactly where the dragged card would land."""
+        total = len(self._entries)
+        target = self._target_for_slot(self._drop_slot, self.drag_row) + 1
+        self.drag_state.emit(
+            f"Moving {self._entries[self.drag_row].caption()} "
+            f"to position {target} of {total}")
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(event)
+        if self.drag_row >= 0:
+            source = self.drag_row
+            target = self._target_for_slot(self._drop_slot, source)
+            entry = self._entries[source].caption()
+            self._end_drag()
+            if target >= 0 and target != source:
+                self.reorder_moved.emit(source, target)
+            else:
+                self.drag_state.emit(f"{entry} stayed at position {source + 1}")
+            return
+        self._press_row = -1
+        self._press_point = None
+        self._press_screen = None
+        super().mouseReleaseEvent(event)
+
+    def _end_drag(self) -> None:
+        self.drag_row = -1
+        self._drop_slot = -1
+        self._press_row = -1
+        self._press_point = None
+        self._press_screen = None
+        self.drag_state.emit("")
+        self.viewport().update()
+
+    def _autoscroll(self, point: QPoint) -> None:
+        """Scroll when dragging past the top or bottom edge of the viewport."""
+        bar = self.verticalScrollBar()
+        margin = 34
+        if point.y() < margin:
+            bar.setValue(bar.value() - 2)
+        elif point.y() > self.viewport().height() - margin:
+            bar.setValue(bar.value() + 2)
+
+    def _slot_at(self, point: QPoint) -> int:
+        """Insertion slot (0..count) the cursor is aiming at.
+
+        Also records ``_after_flag`` so the marker knows which side of the
+        hovered card the card will land on.
+        """
+        count = self.count()
+        self._after_flag = False
+        if not count:
+            return 0
+        row = self._row_at(point)
+        if row < 0:
+            # in the gap between cards - use the closest card
+            best, best_d = 0, None
+            for candidate in range(count):
+                centre = self.visualItemRect(self.item(candidate)).center()
+                distance = ((centre.x() - point.x()) ** 2 + (centre.y() - point.y()) ** 2)
+                if best_d is None or distance < best_d:
+                    best, best_d = candidate, distance
+            row = best
+        rect = self.visualItemRect(self.item(row))
+        self._after_flag = point.x() > rect.center().x()
+        return row + 1 if self._after_flag else row
+
+    def slot_for_point(self, point: QPoint) -> int:
+        """Public slot lookup, clamped to a valid insertion position."""
+        return max(0, min(self._slot_at(point), len(self._entries)))
+
+    def _target_for_slot(self, slot: int, source: int) -> int:
+        """Turn an insertion slot into a final list position for the drag."""
+        target = slot - 1 if slot > source else slot
+        return max(0, min(len(self._entries) - 1, target))
+
+    def _marker_geometry(self) -> tuple[QRectF, QRectF] | None:
+        """Where the dragged card lands: (insertion bar, tinted target cell)."""
+        count = self.count()
+        if not count or self._drop_slot < 0:
+            return None
+        slot = self._drop_slot
+        if slot >= count:
+            after = self.visualItemRect(self.item(count - 1))
+            x = float(after.right())
+            cell = QRectF(after.center().x(), after.y(), after.width() / 2, after.height())
+        else:
+            before = self.visualItemRect(self.item(slot))
+            if self._after_flag:
+                previous = self.visualItemRect(self.item(max(0, slot - 1)))
+                x = float(previous.right())
+                cell = QRectF(before.x(), before.y(), before.width() / 2, before.height())
+            else:
+                x = float(before.left())
+                cell = before
+        bar = QRectF(x - 2.0, cell.y(), 4.0, cell.height())
+        return bar, QRectF(cell)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.drag_row < 0:
+            return
+        geometry = self._marker_geometry()
+        if geometry is None:
+            return
+        bar, cell = geometry
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # tint the cell the card will occupy
+        tint = QPainterPath()
+        tint.addRoundedRect(cell.adjusted(3, 3, -3, -3), 10, 10)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(T.alpha(T.ACCENT, 0.16)))
+        painter.drawPath(tint)
+        # a solid bar at the exact insertion boundary
+        marker = QPainterPath()
+        marker.addRoundedRect(bar, 2.0, 2.0)
+        painter.setBrush(QColor(T.ACCENT))
+        painter.setPen(QPen(QColor("#FFFFFF"), 1.0))
+        painter.drawPath(marker)
+        painter.end()
+
+    # -- dropping image files -------------------------------------------
+    def _urls(self, event) -> list[Path]:
+        if not event.mimeData().hasUrls():
+            return []
+        return [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+
+    def _images_in(self, event) -> list[Path]:
+        return [p for p in self._urls(event)
+                if p.suffix.lower() in self._image_suffixes and p.is_file()]
+
+    def dragEnterEvent(self, event):
+        if self._images_in(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._images_in(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        images = self._images_in(event)
+        if not images:
+            event.ignore()
+            return
+        slot = self._slot_at(event.position().toPoint())
+        self.images_dropped.emit(images, max(0, min(slot, len(self._entries))))
+        event.acceptProposedAction()
 
     def leaveEvent(self, event):
         self.hover_row = -1
@@ -914,10 +1168,12 @@ class PageGrid(QListWidget):
             return
         super().keyPressEvent(event)
 
+    def cell_size(self) -> QSize:
+        return QSize(self.card_width + 12, self.card_height + 12)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        columns = max(1, (self.viewport().width() - 6) // (self.card_width + 12))
-        self.setGridSize(QSize(columns * (self.card_width + 8) + 4, self.card_height + 8))
+        self.setGridSize(self.cell_size())
 
 
 # ---------------------------------------------------------------- feedback
