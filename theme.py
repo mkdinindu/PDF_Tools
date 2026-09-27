@@ -416,6 +416,47 @@ QFrame#CardSunken {{
     border-radius: {RADIUS}px;
 }}
 
+/* ---------- source chips (shared file source) ---------- */
+QFrame#SourceChip {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+QFrame#SourceChip:hover {{
+    background: {SURFACE_ALT};
+    border: 1px solid {BORDER_STRONG};
+}}
+QFrame#SourceChipOn {{
+    background: {ACCENT_SOFT};
+    border: 1.6px solid {ACCENT};
+    border-radius: 12px;
+}}
+QFrame#SourceChip QLabel {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea#ChipScroll {{
+    background: transparent;
+    border: none;
+}}
+QScrollArea#ChipScroll QScrollBar:horizontal {{
+    height: 6px;
+    background: transparent;
+    margin: 0px;
+}}
+QScrollArea#ChipScroll QScrollBar::handle:horizontal {{
+    background: {BORDER_STRONG};
+    border-radius: 3px;
+    min-width: 24px;
+}}
+QScrollArea#ChipScroll QScrollBar::add-line:horizontal,
+QScrollArea#ChipScroll QScrollBar::sub-line:horizontal,
+QScrollArea#ChipScroll QScrollBar::add-page:horizontal,
+QScrollArea#ChipScroll QScrollBar::sub-page:horizontal {{
+    background: none;
+    height: 0px;
+}}
+
 /* ---------- buttons ---------- */
 QPushButton {{
     background: {SURFACE};

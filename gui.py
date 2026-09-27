@@ -22,10 +22,17 @@ from PyQt6.QtCore import (
     QThreadPool,
     pyqtSignal,
 )
-from PyQt6.QtGui import QKeySequence, QPixmap, QShortcut
+from PyQt6.QtGui import (
+    QFontMetrics,
+    QGuiApplication,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLineEdit,
     QScrollArea,
@@ -42,6 +49,7 @@ from widgets import (
     Card,
     DropZone,
     FieldRow,
+    FileChip,
     PageEntry,
     PageGrid,
     ResultCard,
@@ -55,7 +63,6 @@ from widgets import (
     label,
     primary_button,
     soft_button,
-    FileList,
     ProgressStrip,
     _IconBadge,
 )
@@ -134,6 +141,8 @@ class Thumbnailer(QRunnable):
         return (path, index, width, mtime, size)
 
     def run(self):
+        if QGuiApplication.instance() is None:
+            return
         try:
             stat = os.stat(self.path)
         except OSError:
@@ -168,10 +177,253 @@ class Thumbnailer(QRunnable):
             subprocess.run(args, capture_output=True, timeout=40)
         except (subprocess.TimeoutExpired, OSError):
             pass
+        if QGuiApplication.instance() is None:
+            return
         pixmap = QPixmap(str(cache_file)) if cache_file.exists() else None
         if pixmap is not None and pixmap.isNull():
             pixmap = None
         self.signals.ready.emit(self.index, pixmap)
+
+
+# ------------------------------------------------------------ source bar
+class SourceBar(QWidget):
+    """The single place files are loaded. Every tool reads from here.
+
+    Files are added once - by dropping them anywhere in the window or via the
+    browse button - and then reused by all seven tools. The tool that acts on a
+    single document follows the selected chip; merge uses the whole list in
+    order.
+    """
+
+    changed = pyqtSignal()                # the list itself changed
+    current_changed = pyqtSignal(object)  # FileInfo | None
+
+    def __init__(self, window: "MainWindow", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.window = window
+        self._items: list[core.FileInfo] = []
+        self._current = -1
+        self._scan: Scan | None = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(30, 0, 30, 0)
+        row.setSpacing(12)
+
+        self.drop = DropZone("Add PDFs", "drop anywhere", "file", compact=True)
+        self.drop.setFixedWidth(232)
+        self.drop.clicked.connect(self.browse)
+        self.drop.files_dropped.connect(self.add_paths)
+        row.addWidget(self.drop, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.clear = ghost_button("Clear", "close", self.clear_all,
+                                  tooltip="Remove every loaded file")
+        self.clear.setFixedHeight(40)
+        row.addWidget(self.clear, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("ChipScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFixedHeight(64)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._holder = QWidget()
+        self._holder.setStyleSheet("background: transparent;")
+        self._layout = QHBoxLayout(self._holder)
+        self._layout.setContentsMargins(2, 0, 2, 0)
+        self._layout.setSpacing(8)
+        self._layout.addStretch(1)
+        self._scroll.setWidget(self._holder)
+        row.addWidget(self._scroll, 1)
+
+        self._empty = label("No files loaded yet — drop PDFs here or use Add PDFs. "
+                            "Every tool then reuses the file you select.",
+                            12, 500, T.TEXT_MUTED)
+        self._empty.setWordWrap(True)
+        self._rebuild()
+
+    # -- state ----------------------------------------------------------
+    def infos(self) -> list[core.FileInfo]:
+        return list(self._items)
+
+    def usable(self) -> list[core.FileInfo]:
+        return [i for i in self._items if i.ok]
+
+    def current(self) -> core.FileInfo | None:
+        if 0 <= self._current < len(self._items):
+            return self._items[self._current]
+        return None
+
+    def total_pages(self) -> int:
+        return sum(i.pages for i in self.usable())
+
+    def total_size(self) -> str:
+        return core.human_size(sum(i.size for i in self.usable()))
+
+    def set_current(self, index: int) -> None:
+        if index == self._current or not (-1 <= index < len(self._items)):
+            return
+        self._current = index
+        for position, chip in enumerate(self._chips):
+            chip.set_selected(position == index, position + 1)
+        self.current_changed.emit(self.current())
+
+    # -- mutations ------------------------------------------------------
+    def browse(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select PDFs", self.window.last_dir(), "PDF files (*.pdf)")
+        if paths:
+            self.add_paths(paths)
+
+    def add_paths(self, paths) -> None:
+        picked = [p for p in paths if str(p).lower().endswith(".pdf")]
+        if not picked:
+            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
+            return
+        self.window.settings.setValue("last_dir", str(Path(str(picked[0])).parent))
+        known = {str(i.path) for i in self._items}
+        fresh: list[str] = []
+        for path in picked:
+            text = str(path)
+            if text not in known:
+                known.add(text)
+                fresh.append(text)
+        if not fresh:
+            self.window.toasts.notify("Already loaded", "Those files are in the list", "info")
+            return
+        self._scan = Scan(fresh)
+        self.window.progress.start(f"Reading {len(fresh)} file(s)")
+
+        def ok(loaded):
+            self.window.progress.finish("Ready", True)
+            bad = [i for i in loaded if i.error]
+            if bad:
+                self.window.toasts.notify(
+                    f"Skipped {len(bad)} file(s)", f"{bad[0].name}: {bad[0].error}",
+                    "warning", 6000)
+            good = [i for i in loaded if not i.error]
+            if good:
+                self._items.extend(good)
+                if self._current < 0:
+                    self._current = 0
+                self._rebuild()
+                self.changed.emit()
+                self.current_changed.emit(self.current())
+
+        def bad(message):
+            self.window.progress.finish("Failed", False)
+            self.window.toasts.notify("Could not read files", message, "error")
+
+        self._scan.signals.done.connect(ok)
+        self._scan.signals.failed.connect(bad)
+        QThreadPool.globalInstance().start(self._scan)
+
+    def remove_at(self, index: int) -> None:
+        if not (0 <= index < len(self._items)):
+            return
+        self._items.pop(index)
+        if not self._items:
+            self._current = -1
+        elif self._current >= len(self._items):
+            self._current = len(self._items) - 1
+        self._rebuild()
+        self.changed.emit()
+        self.current_changed.emit(self.current())
+
+    def move(self, index: int, delta: int) -> None:
+        target = index + delta
+        if not (0 <= index < len(self._items) and 0 <= target < len(self._items)):
+            return
+        self._items.insert(target, self._items.pop(index))
+        self._current = target
+        self._rebuild()
+        self.changed.emit()
+        self.current_changed.emit(self.current())
+
+    def clear_all(self) -> None:
+        if not self._items:
+            return
+        self._items.clear()
+        self._current = -1
+        self._rebuild()
+        self.changed.emit()
+        self.current_changed.emit(None)
+
+    # -- ui -------------------------------------------------------------
+    @property
+    def _chips(self) -> list[FileChip]:
+        return [w for w in self._holder.findChildren(FileChip)]
+
+    def _rebuild(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None and widget is not self._empty:
+                widget.setParent(None)
+                widget.deleteLater()
+        total = len(self._items)
+        self._empty.setVisible(total == 0)
+        if not total:
+            self._layout.addWidget(self._empty)
+        for index, info in enumerate(self._items):
+            chip = FileChip(
+                info, index + 1, index == self._current,
+                index > 0, index < total - 1,
+                on_pick=partial(self.set_current, index),
+                on_remove=partial(self.remove_at, index),
+                on_move=partial(self.move, index),
+                parent=self._holder,
+            )
+            self._layout.addWidget(chip)
+        self._layout.addStretch(1)
+        chips = self._chips
+        needed = (sum(c.sizeHint().width() for c in chips)
+                  + self._layout.spacing() * (len(chips) + 1) + 4) if chips else 0
+        self._holder.setMinimumWidth(needed)
+        self.clear.setEnabled(total > 0)
+
+
+class UsingBar(QFrame):
+    """Shows which file from the shared source a tool is about to work on."""
+
+    def __init__(self, icon: str, caption: str, on_browse,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("CardSunken")
+        self.setFixedHeight(66)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 0, 12, 0)
+        row.setSpacing(11)
+
+        self.badge = _IconBadge(icon, 34)
+        row.addWidget(self.badge)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.setContentsMargins(0, 0, 0, 0)
+        self.name = label("No file selected", 13, 600, T.TEXT)
+        self.sub = label(caption, 12, 400, T.TEXT_MUTED)
+        text.addWidget(self.name)
+        text.addWidget(self.sub)
+        row.addLayout(text)
+        row.addStretch(1)
+
+        self.browse = ghost_button("Add PDFs", "plus", on_browse,
+                                   tooltip="Add more PDFs to the top bar")
+        self.browse.setFixedHeight(36)
+        row.addWidget(self.browse)
+
+    def set_info(self, info: core.FileInfo | None) -> None:
+        if info is None:
+            self.name.setText("No file selected")
+            self.name.setStyleSheet(f"color: {T.TEXT_MUTED};")
+        else:
+            metrics = QFontMetrics(self.name.font())
+            self.name.setText(metrics.elidedText(info.name, Qt.TextElideMode.ElideMiddle, 430))
+            self.name.setStyleSheet("")
+
+    def set_detail(self, text: str) -> None:
+        self.sub.setText(text)
 
 
 # ---------------------------------------------------------------- panels
@@ -183,16 +435,36 @@ class ToolPanel(QWidget):
     subtitle = ""
     action_label = "Run"
     action_icon = "sparkle"
-    accept_multiple = False
-    accept_folders = False
 
     def __init__(self, window: "MainWindow"):
         super().__init__()
         self.window = window
-        self.paths: list[str] = []
-        self._scan: Scan | None = None
         self._jobs: list[Job] = []
         self.setAcceptDrops(True)
+        window.source.current_changed.connect(self._on_source)
+
+    # -- shared source --------------------------------------------------
+    @property
+    def source(self) -> SourceBar:
+        return self.window.source
+
+    @property
+    def info(self) -> core.FileInfo | None:
+        """The file this tool works on - the one selected in the top bar."""
+        return self.window.source.current()
+
+    @property
+    def paths(self) -> list[str]:
+        info = self.info
+        return [str(info.path)] if info is not None else []
+
+    def _on_source(self, info) -> None:
+        """Called whenever the shared source list or selection changes."""
+        self._refresh_source()
+        self._sync()
+
+    def _refresh_source(self) -> None:  # pragma: no cover - overridden
+        """Reset per-file state that no longer applies. Called on every change."""
 
     # -- helpers used by subclasses -------------------------------------
     def busy(self, value: bool) -> None:
@@ -227,33 +499,6 @@ class ToolPanel(QWidget):
         job.signals.failed.connect(bad)
         QThreadPool.globalInstance().start(job)
 
-    def scan_files(self, paths, on_done=None) -> None:
-        unique: list[str] = []
-        seen = set()
-        for p in paths:
-            text = str(p)
-            if text in seen:
-                continue
-            seen.add(text)
-            unique.append(text)
-        if not unique:
-            return
-        self._scan = Scan(unique)
-        self.window.progress.start(f"Reading {len(unique)} file(s)")
-
-        def ok(infos):
-            self.window.progress.finish("Ready", True)
-            if on_done:
-                on_done(infos)
-
-        def bad(message):
-            self.window.progress.finish("Failed", False)
-            self.window.toasts.notify("Could not read files", message, "error")
-
-        self._scan.signals.done.connect(ok)
-        self._scan.signals.failed.connect(bad)
-        QThreadPool.globalInstance().start(self._scan)
-
     def load_thumbs(self, grid: PageGrid, path: str, count: int) -> None:
         signals = ThumbSignals()
         signals.ready.connect(partial(self._apply_thumb, grid, path, count))
@@ -262,7 +507,8 @@ class ToolPanel(QWidget):
             pool.start(Thumbnailer(path, i, grid.card_width, signals, id(grid)))
 
     def _apply_thumb(self, grid: PageGrid, path: str, count: int, index: int, pixmap) -> None:
-        if self.paths and self.paths[0] != path:
+        info = self.info
+        if info is not None and str(info.path) != path:
             return
         entries = grid.entries()
         if index < len(entries) and pixmap is not None:
@@ -284,8 +530,12 @@ class ToolPanel(QWidget):
         if paths:
             self.accept_paths(paths)
 
-    def accept_paths(self, paths) -> None:  # pragma: no cover - overridden
-        pass
+    def accept_paths(self, paths) -> None:
+        """Drops never land in a single tool - they feed the shared source."""
+        self.window.source.add_paths(paths)
+
+    def _browse_source(self) -> None:
+        self.window.source.browse()
 
 
 class MergePanel(ToolPanel):
@@ -294,7 +544,6 @@ class MergePanel(ToolPanel):
     subtitle = "Combine lecture notes, chapters or scans into one document."
     action_label = "Merge documents"
     action_icon = "merge"
-    accept_multiple = True
 
     def __init__(self, window):
         super().__init__(window)
@@ -302,24 +551,21 @@ class MergePanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        # drop zone
-        self.drop = DropZone("Drop PDFs here", "or click to browse  ·  files merge top to bottom",
-                             "merge")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        # which files are being merged, straight from the shared source
+        self.using = UsingBar("merge", "No files loaded yet.", self._browse_source)
+        layout.addWidget(self.using)
 
-        # queue card
+        # order card - the chips in the top bar are the queue
         self.queue_card = Card(pad=18)
-        header = SectionHeader("Merge order",
-                               "Reorder with the arrows — the first file starts the document.")
-        clear = ghost_button("Clear all", "close", self._clear)
-        header.add_action(clear)
-        self.queue_card.add(header)
+        self.queue_card.add(SectionHeader(
+            "Merge order",
+            "Drag PDFs into the app, then reorder them in the top bar — "
+            "the first file starts the document."))
         self.summary = label("", 12, 500, T.TEXT_MUTED)
         self.queue_card.add(self.summary)
-        self.files = FileList(on_change=self._sync)
-        self.queue_card.add(self.files, 1)
+        self.order = label("", 12, 400, T.TEXT_MUTED)
+        self.order.setWordWrap(True)
+        self.queue_card.add(self.order)
         layout.addWidget(self.queue_card, 1)
 
         # output
@@ -333,23 +579,9 @@ class MergePanel(ToolPanel):
         # action bar
         self.action = primary_button(self.action_label, self.action_icon, self._run)
         self.progress_strip = ResultCard()
-        self.progress = self.window.progress
-        bar = QWidget()
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.setSpacing(10)
-        bar_layout.addWidget(self.action)
-        bar_layout.addStretch(1)
-        bar_layout.addWidget(self.progress_strip)
         layout.addWidget(self.progress_strip)
-        layout.addWidget(bar)
+        layout.addWidget(self.action)
         self._sync()
-
-    def _browse(self):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select PDFs to merge", self.window.last_dir(), "PDF files (*.pdf)")
-        if paths:
-            self.accept_paths(paths)
 
     def _choose_output(self):
         suggested = self.output.text() or "merged.pdf"
@@ -359,48 +591,38 @@ class MergePanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        paths = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not paths:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
-            return
-        self.scan_files(paths, self._on_scanned)
-
-    def _on_scanned(self, infos):
-        existing = {str(i.path) for i in self.files.infos()}
-        fresh = [i for i in infos if str(i.path) not in existing]
-        self.files.add_items(fresh)
-        bad = [i for i in infos if i.error]
-        if bad:
-            self.window.toasts.notify(
-                f"Skipped {len(bad)} file(s)", f"{bad[0].name}: {bad[0].error}", "warning", 6000)
-        if fresh and not self.output.text().endswith(".pdf"):
-            self.output.set_text("merged.pdf")
-
-    def _clear(self):
-        self.files.clear()
+    def _refresh_source(self) -> None:
         self.progress_strip.hide_result()
-        self._sync()
 
     def _sync(self):
-        items = self.files.infos()
-        usable = [i for i in items if i.ok]
-        total_pages = sum(i.pages for i in usable)
+        items = self.source.infos()
+        usable = self.source.usable()
         if not items:
-            self.summary.setText("No files queued yet.")
+            self.using.set_info(None)
+            self.using.set_detail("Load two or more PDFs in the top bar.")
+            self.summary.setText("No files loaded yet.")
+            self.order.setText("")
         elif len(usable) < 2:
-            self.summary.setText(f"{len(usable)} file queued — add one more to merge.")
+            self.using.set_info(items[0])
+            self.using.set_detail("1 file loaded — add one more in the top bar.")
+            self.summary.setText(f"{len(usable)} file loaded — add one more to merge.")
+            self.order.setText("")
         else:
+            self.using.set_info(None)
+            self.using.set_detail(
+                f"{len(usable)} files selected · {self.source.total_pages()} pages · "
+                f"{self.source.total_size()}")
             self.summary.setText(
-                f"{len(usable)} files  ·  {total_pages} pages  ·  "
-                f"{core.human_size(sum(i.size for i in usable))}")
+                f"Merging {len(usable)} files · {self.source.total_pages()} pages · "
+                f"{self.source.total_size()}")
+            numbered = "  →  ".join(f"{n}. {i.name}" for n, i in enumerate(usable, 1))
+            self.order.setText(numbered)
         self.action.setEnabled(len(usable) >= 2)
-        self.drop.set_active(not items)
 
     def _run(self):
-        usable = [i for i in self.files.infos() if i.ok]
+        usable = self.source.usable()
         if len(usable) < 2:
-            self.window.toasts.notify("Need more files", "Queue at least two readable PDFs",
+            self.window.toasts.notify("Need more files", "Load at least two readable PDFs",
                                       "warning")
             return
         target = self.output.text() or "merged.pdf"
@@ -431,18 +653,15 @@ class SplitPanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to split", "or click to choose one", "split")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("split", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
-        self.info = Card(pad=18)
-        self.info_header = SectionHeader("How should it be split?")
-        self.info.add(self.info_header)
-
+        self.options = Card(pad=18)
+        self.options.add(SectionHeader("How should it be split?"))
         self.modes = SegmentedControl([("range", "Page range"), ("each", "Every N pages")])
         self.modes.changed.connect(self._on_mode)
-        self.info.add(self.modes)
+        self.options.add(self.modes)
 
         self.range_row = QWidget()
         range_layout = QHBoxLayout(self.range_row)
@@ -453,7 +672,7 @@ class SplitPanel(ToolPanel):
         self.range_hint = label("", 12, 500, T.TEXT_MUTED)
         self.range_hint.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         range_layout.addWidget(self.range_hint)
-        self.info.add(self.range_row)
+        self.options.add(self.range_row)
 
         self.each_row = QWidget()
         each_layout = QHBoxLayout(self.each_row)
@@ -468,7 +687,7 @@ class SplitPanel(ToolPanel):
         each_layout.addWidget(label("1 = one file per page", 12, 400, T.TEXT_SUBTLE))
         each_layout.addStretch(1)
         self.each_row.setVisible(False)
-        self.info.add(self.each_row)
+        self.options.add(self.each_row)
 
         self.page_buttons = QWidget()
         pb_layout = QHBoxLayout(self.page_buttons)
@@ -481,8 +700,8 @@ class SplitPanel(ToolPanel):
             self._quick.append(btn)
             pb_layout.addWidget(btn)
         pb_layout.addStretch(1)
-        self.info.add(self.page_buttons)
-        layout.addWidget(self.info)
+        self.options.add(self.page_buttons)
+        layout.addWidget(self.options)
 
         output_card = Card(pad=18)
         output_card.add(SectionHeader("Output", "A file for ranges, a folder for chunks."))
@@ -508,12 +727,6 @@ class SplitPanel(ToolPanel):
         self.each_row.setVisible(not is_range)
         self._sync()
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         if self.modes.value() == "each":
             path = QFileDialog.getExistingDirectory(
@@ -528,35 +741,25 @@ class SplitPanel(ToolPanel):
             if path:
                 self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
+    def _refresh_source(self) -> None:
+        info = self.info
+        self.result.hide_result()
+        self.range_field.set_text("")
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to split it.")
             return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "split")
-        self._sync()
-
+        self.output.set_text(f"{Path(info.path).stem}_split.pdf")
+        self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
     def _sync(self):
-        has = bool(self.paths)
+        has = self.info is not None
         self.action.setEnabled(has)
-        self.drop.set_active(not has)
         self.page_buttons.setEnabled(has)
         self.modes.setEnabled(has)
         self.range_field.setEnabled(has)
         self.every.setEnabled(has)
         if has:
-            total = self.source.pages
+            total = self.info.pages
             if not self.range_field.text():
                 self.range_field.set_text(f"1-{total}")
             self.range_hint.setText(f"of {total}")
@@ -564,7 +767,7 @@ class SplitPanel(ToolPanel):
     def _quick_pick(self, which):
         if not self.paths:
             return
-        total = self.source.pages
+        total = self.info.pages
         if which == "All":
             spec = f"1-{total}"
         elif which == "First half":
@@ -623,10 +826,9 @@ class CompressPanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to compress", "or click to choose one", "compress")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("compress", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
         self.card = Card(pad=18)
         self.card.add(SectionHeader(
@@ -674,12 +876,6 @@ class CompressPanel(ToolPanel):
         preset = core.COMPRESSION_PRESETS[key]
         self.level_hint.setText(f"{preset['label']} — {preset['hint']}")
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         suggested = self.output.text() or "compressed.pdf"
         path, _ = QFileDialog.getSaveFileName(
@@ -688,33 +884,20 @@ class CompressPanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
-            return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "compress")
-        stem = Path(info.path).stem
-        self.output.set_text(f"{stem}_compressed.pdf")
-        self.original_badge.setText(info.size_text)
+    def _refresh_source(self) -> None:
+        info = self.info
         self.result.hide_result()
-        self._sync()
-
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to compress it.")
+            self.original_badge.setText("-")
+            return
+        self.output.set_text(f"{Path(info.path).stem}_compressed.pdf")
+        self.original_badge.setText(info.size_text)
+        self.using.set_detail(f"{info.pages} pages  ·  {info.size_text} before compressing")
     def _sync(self):
-        has = bool(self.paths)
+        has = self.info is not None
         self.action.setEnabled(has)
-        self.drop.set_active(not has)
         self.levels.setEnabled(has)
         self.output.setEnabled(has)
 
@@ -752,10 +935,9 @@ class RotatePanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to rotate", "or click to choose one", "rotate")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("rotate", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
         self.card = Card(pad=18)
         self.card.add(SectionHeader("Rotation", "Applied as a new copy — the original stays as it is."))
@@ -807,12 +989,6 @@ class RotatePanel(ToolPanel):
         self.range_field.setVisible(key == "range")
         self._sync()
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         suggested = self.output.text() or "rotated.pdf"
         path, _ = QFileDialog.getSaveFileName(
@@ -821,39 +997,27 @@ class RotatePanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
+    def _refresh_source(self) -> None:
+        info = self.info
+        self.result.hide_result()
+        self.range_field.set_text("")
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to rotate it.")
             return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "rotate")
         self.output.set_text(f"{Path(info.path).stem}_rotated.pdf")
         self.range_field.set_text(f"1-{info.pages}")
-        self.result.hide_result()
-        self._sync()
-
+        self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
     def _sync(self):
-        has = bool(self.paths)
+        has = self.info is not None
         self.action.setEnabled(has)
-        self.drop.set_active(not has)
         self.angles.setEnabled(has)
         self.scope.setEnabled(has)
         self.output.setEnabled(has)
         if not has:
             self.preview.setText("")
             return
-        total = self.source.pages
+        total = self.info.pages
         angle = int(self.angles.value())
         if self.scope.value() == "all":
             self.preview.setText(f"All {total} pages will be turned {angle}° clockwise.")
@@ -896,10 +1060,9 @@ class OrganizePanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to organise", "or click to choose one", "organize")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("organize", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
         self.card = Card(pad=18)
         header = SectionHeader("Pages", "Click to select, Ctrl+click for more. "
@@ -953,12 +1116,6 @@ class OrganizePanel(ToolPanel):
         self.total = 0
         self._sync()
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         suggested = self.output.text() or "edited.pdf"
         path, _ = QFileDialog.getSaveFileName(
@@ -967,31 +1124,22 @@ class OrganizePanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
+    def _refresh_source(self) -> None:
+        info = self.info
+        self.result.hide_result()
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to reorganise its pages.")
+            self.total = 0
+            self.entries = []
+            self.grid.set_entries([])
             return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
         self.total = info.pages
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "organize")
         self.output.set_text(f"{Path(info.path).stem}_edited.pdf")
         self.entries = [PageEntry(index=i) for i in range(info.pages)]
         self.grid.set_entries(self.entries)
         self.window.progress.start("Rendering page previews")
-        self.result.hide_result()
-        self._sync()
-
+        self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
     def _thumbs_wanted(self):
         if self.paths and self.entries:
             self.window.progress.start("Rendering page previews")
@@ -1060,9 +1208,8 @@ class OrganizePanel(ToolPanel):
         count = len(self._selected()) if self.entries else 0
         self.selection_badge.setText(f"{count} selected" if count else "Nothing selected")
         self.selection_badge.set_tone("accent" if count else "neutral")
-        has = bool(self.paths) and bool(self.entries)
+        has = self.info is not None and bool(self.entries)
         self.action.setEnabled(has)
-        self.drop.set_active(not self.paths)
         self.output.setEnabled(has)
         if has:
             self.action.setText(f"Save {len(self.entries)} pages")
@@ -1094,10 +1241,9 @@ class ProtectPanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to protect", "or click to choose one", "lock")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("lock", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
         self.card = Card(pad=18)
         self.card.add(SectionHeader("Password", "Viewers ask for this before showing the document."))
@@ -1139,12 +1285,6 @@ class ProtectPanel(ToolPanel):
         layout.addLayout(bar)
         self._sync()
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         suggested = self.output.text() or "protected.pdf"
         path, _ = QFileDialog.getSaveFileName(
@@ -1153,33 +1293,23 @@ class ProtectPanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
-            return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "lock")
-        self.output.set_text(f"{Path(info.path).stem}_protected.pdf")
+    def _refresh_source(self) -> None:
+        info = self.info
         self.result.hide_result()
-        self._sync()
-
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to protect it.")
+            return
+        self.output.set_text(f"{Path(info.path).stem}_protected.pdf")
+        if info.encrypted:
+            self.using.set_detail(f"{info.pages} pages  ·  already password protected")
+        else:
+            self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
     def _sync(self):
-        has = bool(self.paths)
+        has = self.info is not None
         password = self.password.text()
         match = password and password == self.confirm.text()
         self.action.setEnabled(has and bool(match))
-        self.drop.set_active(not has)
         if not has:
             return
         if password and not match:
@@ -1221,10 +1351,9 @@ class MetadataPanel(ToolPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
-        self.drop = DropZone("Drop a PDF to edit", "or click to choose one", "tag")
-        self.drop.clicked.connect(self._browse)
-        self.drop.files_dropped.connect(self.accept_paths)
-        layout.addWidget(self.drop)
+        self.using = UsingBar("tag", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
 
         self.card = Card(pad=18)
         self.card.add(SectionHeader("Document information",
@@ -1265,12 +1394,6 @@ class MetadataPanel(ToolPanel):
         layout.addLayout(bar)
         self._sync()
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a PDF", self.window.last_dir(), "PDF files (*.pdf)")
-        if path:
-            self.accept_paths([path])
-
     def _choose_output(self):
         suggested = self.output.text() or "meta.pdf"
         path, _ = QFileDialog.getSaveFileName(
@@ -1279,23 +1402,16 @@ class MetadataPanel(ToolPanel):
         if path:
             self.output.set_text(path)
 
-    def accept_paths(self, paths):
-        pdfs = [p for p in paths if str(p).lower().endswith(".pdf")]
-        if not pdfs:
-            self.window.toasts.notify("Only PDFs", "That file is not a .pdf", "warning")
+    def _refresh_source(self) -> None:
+        info = self.info
+        self.result.hide_result()
+        self.using.set_info(info)
+        if info is None:
+            self.using.set_detail("Pick a file in the top bar to edit its details.")
+            for edit in self.inputs.values():
+                edit.clear()
+            self.current.setText("No file selected")
             return
-        self.scan_files(pdfs[:1], self._on_scanned)
-
-    def _on_scanned(self, infos):
-        info = infos[0]
-        if info.error:
-            self.window.toasts.notify("Cannot open it", info.error, "error")
-            self.paths = []
-            self._sync()
-            return
-        self.paths = [str(info.path)]
-        self.source = info
-        self.drop.set_state(info.name, f"{info.pages} pages  ·  {info.size_text}", "tag")
         self.output.set_text(f"{Path(info.path).stem}_meta.pdf")
         try:
             values = core.read_metadata(info.path)
@@ -1308,13 +1424,10 @@ class MetadataPanel(ToolPanel):
         self.current.setText(
             f"{len(filled)} of {len(self.FIELDS)} fields already set" if filled
             else "No metadata set yet")
-        self.result.hide_result()
-        self._sync()
-
+        self.using.set_detail(f"{info.pages} pages  ·  {info.size_text}")
     def _sync(self):
-        has = bool(self.paths)
+        has = self.info is not None
         self.action.setEnabled(has)
-        self.drop.set_active(not has)
         self.output.setEnabled(has)
         for edit in self.inputs.values():
             edit.setEnabled(has)
@@ -1356,6 +1469,7 @@ class MainWindow(QWidget):
         self.busy_flag = False
         self.panels: list[ToolPanel] = []
         self.nav_buttons: list[Button] = []
+        self.source = SourceBar(self)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1461,9 +1575,14 @@ class MainWindow(QWidget):
     def _build_header(self) -> QWidget:
         header = QWidget()
         header.setObjectName("Header")
-        header.setFixedHeight(84)
-        row = QHBoxLayout(header)
-        row.setContentsMargins(30, 0, 30, 0)
+        header.setFixedHeight(152)
+
+        column = QVBoxLayout(header)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(30, 14, 30, 6)
         row.setSpacing(14)
         text = QVBoxLayout()
         text.setSpacing(3)
@@ -1476,6 +1595,9 @@ class MainWindow(QWidget):
         self.hint = label("", 12, 600, T.WARNING)
         row.addWidget(self.hint)
         row.addWidget(ghost_button("Open folder", "folder", self._open_folder))
+        column.addLayout(row)
+
+        column.addWidget(self.source)
         return header
 
     def _build_panels(self) -> None:
@@ -1545,19 +1667,17 @@ class MainWindow(QWidget):
             return
         if paths:
             self.settings.setValue("last_dir", str(Path(paths[0]).parent))
-        panel = self.stack.currentWidget()
-        if isinstance(panel, ToolPanel):
-            panel.accept_paths(paths)
+        self.source.add_paths(paths)
 
     def closeEvent(self, event):
         if self.busy_flag:
             self.toasts.notify("Still working", "Wait for the job to finish", "warning")
             event.ignore()
             return
-        if self.stack.currentIndex() >= 0:
-            panel = self.stack.currentWidget()
-            if getattr(panel, "paths", None):
-                self.settings.setValue("last_dir", str(Path(panel.paths[0]).parent))
+        info = self.source.current()
+        if info is not None:
+            self.settings.setValue("last_dir", str(info.path.parent))
+        QThreadPool.globalInstance().waitForDone(2500)
         event.accept()
 
 

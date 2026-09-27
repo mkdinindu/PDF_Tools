@@ -24,6 +24,7 @@ from PyQt6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QFontMetrics,
     QKeyEvent,
     QLinearGradient,
     QPainter,
@@ -401,34 +402,46 @@ class DropZone(QFrame):
     clicked = pyqtSignal()
 
     def __init__(self, title: str, hint: str, icon: str = "file",
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, compact: bool = False):
         super().__init__(parent)
         self.setObjectName("CardSunken")
         self._hover = False
         self._icon = icon
         self._active = True
+        self.compact = compact
         self.setAcceptDrops(True)
-        self.setMinimumHeight(132)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 22, 18, 22)
-        layout.setSpacing(5)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.badge = _IconBadge(icon)
-        row = QHBoxLayout()
-        row.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        row.addWidget(self.badge)
-        layout.addLayout(row)
-
-        self.title = label(title, 14, 600, T.TEXT)
-        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.title)
+        self.badge = _IconBadge(icon, 30 if compact else 44)
+        self.title = label(title, 13 if compact else 14, 600, T.TEXT)
         self.hint = label(hint, 12, 400, T.TEXT_MUTED)
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.hint)
+
+        if compact:
+            self.setFixedHeight(50)
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(16, 0, 16, 0)
+            layout.setSpacing(9)
+            self.title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            layout.addWidget(self.badge)
+            layout.addWidget(self.title)
+            layout.addWidget(self.hint)
+            layout.addStretch(1)
+        else:
+            self.setMinimumHeight(132)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(18, 22, 18, 22)
+            layout.setSpacing(5)
+            layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row = QHBoxLayout()
+            row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row.addWidget(self.badge)
+            layout.addLayout(row)
+            self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(self.title)
+            layout.addWidget(self.hint)
 
     def set_state(self, title: str, hint: str, icon: str | None = None) -> None:
         self.title.setText(title)
@@ -488,7 +501,9 @@ class DropZone(QFrame):
         hot = self._hover and active
         border = T.ACCENT if hot else (T.BORDER_STRONG if active else T.BORDER)
         width = 2.0 if hot else 1.4
-        painter.setPen(QPen(QColor(border), width, Qt.PenStyle.DashLine if active else Qt.PenStyle.SolidLine))
+        dash = active and not self.compact
+        painter.setPen(QPen(QColor(border), width,
+                            Qt.PenStyle.DashLine if dash else Qt.PenStyle.SolidLine))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         radius = T.RADIUS
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), radius, radius)
@@ -562,85 +577,85 @@ class Badge(QLabel):
             f"background: {bg}; color: {fg}; border-radius: 6px; padding: 3px 7px;")
 
 
-# ---------------------------------------------------------------- file list
-class FileStripItem(QWidget):
-    """One row in the merge queue."""
+# ---------------------------------------------------------------- source chip
+class FileChip(QFrame):
+    """One loaded document in the shared source bar."""
 
-    def __init__(self, info: FileInfo, index: int, on_remove=None, on_move=None,
-                 total: int = 1, parent: QWidget | None = None):
+    def __init__(self, info: FileInfo, position: int, selected: bool,
+                 can_up: bool, can_down: bool, on_pick=None, on_remove=None,
+                 on_move=None, parent: QWidget | None = None):
         super().__init__(parent)
         self.info = info
-        self.index = index
+        self.position = position
+        self._on_pick = on_pick
         self._on_remove = on_remove
         self._on_move = on_move
-        self._total = total
-        self.setFixedHeight(62)
-        self.setObjectName("CardSunken")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setObjectName("SourceChipOn" if selected else "SourceChip")
+        self.setFixedHeight(52)
+        self.setFixedWidth(248)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(12, 9, 10, 9)
-        row.setSpacing(11)
+        row.setContentsMargins(10, 0, 6, 0)
+        row.setSpacing(7)
 
-        self.order = label(f"{index + 1}", 12, 700, T.ACCENT)
-        self.order.setFixedWidth(18)
+        self.glyph = _FileGlyph()
+        row.addWidget(self.glyph)
+
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        text.setContentsMargins(0, 0, 0, 0)
+        metrics = QFontMetrics(self.font())
+        self.name = label(metrics.elidedText(info.name, Qt.TextElideMode.ElideMiddle, 138),
+                           12, 600, T.TEXT)
+        detail = f"{info.pages} pages  ·  {info.size_text}" if info.ok else "unreadable"
+        self.sub = label(metrics.elidedText(detail, Qt.TextElideMode.ElideRight, 138),
+                         11, 400, T.TEXT_MUTED)
+        text.addWidget(self.name)
+        text.addWidget(self.sub)
+        row.addLayout(text)
+        row.addStretch(1)
+
+        self.order = label(str(position), 11, 700, T.ACCENT if selected else T.TEXT_MUTED,
+                          "ChipOrder")
+        self.order.setFixedWidth(14)
         self.order.setAlignment(Qt.AlignmentFlag.AlignCenter)
         row.addWidget(self.order)
 
-        glyph = _FileGlyph()
-        row.addWidget(glyph)
+        self.up = icon_button("up", lambda: self._move(-1), "Move earlier", 22)
+        self.up.setEnabled(can_up)
+        self.down = icon_button("down", lambda: self._move(1), "Move later", 22)
+        self.down.setEnabled(can_down)
+        self.remove = icon_button("close", self._remove, "Remove", 22, danger=True)
+        for button in (self.up, self.down, self.remove):
+            button.setFixedSize(22, 22)
+            row.addWidget(button)
 
-        text_column = QVBoxLayout()
-        text_column.setSpacing(2)
-        name = label(info.name, 13, 600, T.TEXT)
-        name.setToolTip(str(info.path))
-        text_column.addWidget(name)
-        sub_color = T.DANGER if info.error else T.TEXT_SUBTLE
-        sub_text = info.error or f"{info.pages} pages  ·  {info.size_text}"
-        sub = label(sub_text, 11, 500 if info.error else 400, sub_color)
-        text_column.addWidget(sub)
-        row.addLayout(text_column, 1)
+    def set_selected(self, selected: bool, position: int) -> None:
+        self.setObjectName("SourceChipOn" if selected else "SourceChip")
+        self.position = position
+        self.order.setText(str(position))
+        self.order.setStyleSheet(
+            f"color: {T.ACCENT if selected else T.TEXT_MUTED};")
+        self._restyle()
 
-        if not info.error:
-            badge = Badge(f"{info.pages} pages" if info.pages else "?")
-            row.addWidget(badge)
-        elif info.error:
-            row.addWidget(Badge("unreadable", "danger"))
-
-        self.up = icon_button("arrow_up", lambda: self._on_move(self.index, -1),
-                              "Move up", 28)
-        self.down = icon_button("arrow_down", lambda: self._on_move(self.index, 1),
-                                "Move down", 28)
-        row.addWidget(self.up)
-        row.addWidget(self.down)
-        row.addWidget(icon_button("close", self._remove, "Remove", 28, danger=True))
-        self._sync_buttons()
-
-    def _sync_buttons(self) -> None:
-        self.up.setEnabled(self._can_move(-1))
-        self.down.setEnabled(self._can_move(1))
-
-    def _can_move(self, delta: int) -> bool:
-        if self._on_move is None:
-            return False
-        return 0 <= self.index + delta < self._total
+    def _move(self, delta: int) -> None:
+        if self._on_move:
+            self._on_move(delta)
 
     def _remove(self) -> None:
         if self._on_remove:
-            self._on_remove(self.index)
+            self._on_remove()
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.info.error:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(T.alpha(T.DANGER, 0.04))
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect().adjusted(0, 0, -1, -1)), T.RADIUS, T.RADIUS)
-        painter.drawPath(path)
-        painter.end()
+    def _restyle(self) -> None:
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._on_pick:
+            self._on_pick()
+        super().mouseReleaseEvent(event)
 
 
 class _FileGlyph(QWidget):
@@ -668,82 +683,6 @@ class _ScrollArea(QScrollArea):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("QScrollArea{background:transparent;border:none;}")
-
-
-class FileList(QWidget):
-    """Ordered list of queued PDFs with move/remove controls."""
-
-    def __init__(self, on_change=None, parent: QWidget | None = None):
-        super().__init__(parent)
-        self._on_change = on_change
-        self._items: list[FileInfo] = []
-        self._scroll = _ScrollArea()
-        self._holder = QWidget()
-        self._holder.setStyleSheet("background: transparent;")
-        self._layout = QVBoxLayout(self._holder)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(8)
-        self._scroll.setWidget(self._holder)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self._scroll)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(150)
-
-    def total(self) -> int:
-        return len(self._items)
-
-    def infos(self) -> list[FileInfo]:
-        return list(self._items)
-
-    def paths(self) -> list[str]:
-        return [str(i.path) for i in self._items if i.ok]
-
-    def clear(self) -> None:
-        self._items = []
-        self._rebuild()
-
-    def set_items(self, items: list[FileInfo]) -> None:
-        self._items = list(items)
-        self._rebuild()
-
-    def add_items(self, items: list[FileInfo]) -> None:
-        self._items.extend(items)
-        self._rebuild()
-
-    def remove_at(self, index: int) -> None:
-        if 0 <= index < len(self._items):
-            self._items.pop(index)
-            self._rebuild()
-
-    def move(self, index: int, delta: int) -> None:
-        target = index + delta
-        if 0 <= index < len(self._items) and 0 <= target < len(self._items):
-            self._items.insert(target, self._items.pop(index))
-            self._rebuild()
-
-    def _rebuild(self) -> None:
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        for i, info in enumerate(self._items):
-            self._layout.addWidget(
-                FileStripItem(info, i, self.remove_at, self.move, len(self._items)))
-        self._layout.addStretch(1)
-        if self._on_change:
-            self._on_change()
-
-
-# ---------------------------------------------------------------- page grid
-@dataclass
-class PageEntry:
-    index: int          # 0-based in the source document
-    rotation: int = 0   # extra rotation applied on top of the source
-    thumb: QPixmap | None = None
-    selected: bool = False
 
 
 class PageGridDelegate(QStyledItemDelegate):
@@ -842,6 +781,16 @@ class PageGridDelegate(QStyledItemDelegate):
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                          f"Page {entry.index + 1}")
         painter.restore()
+
+
+@dataclass
+class PageEntry:
+    """One page in the organise grid."""
+
+    index: int
+    rotation: int = 0
+    thumb: QPixmap | None = None
+    selected: bool = False
 
 
 class PageGrid(QListWidget):

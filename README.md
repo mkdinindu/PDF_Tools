@@ -24,11 +24,27 @@ back to re-encoding embedded images.
 python3 PDF_Tools.py            # or: python3 PDF_Tools.py --gui
 ```
 
-Seven tools, all with drag and drop:
+### Load your files once
+
+There is a single source bar at the top of the window. Drop PDFs anywhere in the
+app — the bar, the sidebar, a tool screen — or press **Add PDFs**. That is the
+only upload step; the files stay loaded for the whole session.
+
+Each chip is one document:
+
+- **click** it to point the current tool at that file
+- **▲ ▼** to change the order (this is the merge order)
+- **✕** to remove it, and **Clear** to empty the bar
+
+Merge uses every loaded file in bar order. The other six tools work on the chip
+you have selected, and they re-target themselves the moment you select a
+different one — no re-uploading, no re-picking.
+
+### Tools
 
 | Tool | What it does |
 | --- | --- |
-| **Merge PDFs** | Combine documents, reorder the queue with the arrows |
+| **Merge PDFs** | Combine every loaded file, in the order shown in the bar |
 | **Split** | Extract a page range, or cut into chunks of N pages |
 | **Compress** | Three levels, each reported with the size actually saved |
 | **Rotate** | All pages or a chosen range, 90/180/270° |
@@ -36,8 +52,10 @@ Seven tools, all with drag and drop:
 | **Protect** | Add an open password, optionally blocking print and copy |
 | **Metadata** | Title, author, subject and keywords |
 
-`Ctrl+1` … `Ctrl+7` switch tools, `Ctrl+Q` quits. Long jobs run on a background
-thread with a progress bar, so the window stays responsive.
+Output names are filled in for you (`notes.pdf` → `notes_compressed.pdf`), so
+switching files updates the target too. `Ctrl+1` … `Ctrl+7` switch tools,
+`Ctrl+Q` quits. Long jobs run on a background thread with a progress bar, so the
+window stays responsive.
 
 ## Command line
 
@@ -68,6 +86,6 @@ python3 PDF_Tools.py --help
 ## Notes
 
 - Your originals are never modified. Every tool writes a new file, and the app
-  refuses to overwrite a file you dropped in.
-- Output names are suggested for you, e.g. `notes.pdf` → `notes_compressed.pdf`.
+  refuses to overwrite a file you loaded.
 - The engine is [pypdf](https://pypdf.readthedocs.io/); the interface is PyQt6.
+- The command line is unchanged, so any scripts you already have keep working.
