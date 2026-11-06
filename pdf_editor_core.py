@@ -30,6 +30,8 @@ from typing import Callable, Iterable, Sequence
 
 from pdf_core import JobResult, PdfToolError, human_size, noop_progress
 
+import legacy_sinhala as legacy
+
 # PyMuPDF renamed its import from ``fitz`` to ``pymupdf``.  Support both so the
 # editor works with 1.24 (the first release with the pymupdf alias) and 2.x.
 try:  # pragma: no cover - import setup
@@ -842,10 +844,17 @@ def _extract_text(page) -> list[TextItem]:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
-            spans = [s for s in line.get("spans", []) if str(s.get("text", "")).strip()]
+            all_spans = list(line.get("spans", []))
+            spans = [s for s in all_spans if str(s.get("text", "")).strip()]
             if not spans:
                 continue
-            text = "".join(str(s.get("text", "")) for s in spans)
+            # Legacy Sinhala fonts (FM Abhaya, Bindumathi, ...) extract as Latin
+            # look-alike bytes.  Decode each span with its own font so mixed
+            # lines (Sinhala + digits/Latin) come out right, and keep the
+            # whitespace-only spans so words are not glued together.
+            text = "".join(
+                legacy.decode_for_font(str(s.get("text", "")), str(s.get("font", "")))
+                for s in all_spans)
             if not text.strip():
                 continue
             bbox = _rect_tuple(line.get("bbox") or spans[0].get("bbox"))
