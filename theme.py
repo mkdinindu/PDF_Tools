@@ -234,6 +234,54 @@ _PATHS: dict[str, list] = {
         ("arc", (12, 12, 3.1, 0, 360)),
         ("arc", (12, 12, 7.6, 0, 360, 1)),
     ],
+    "edit": [
+        ("poly", [4.5, 19.5, 6.4, 13.4, 16.3, 3.5, 20.5, 7.7, 10.6, 17.6]),
+        ("line", [6.4, 13.4, 10.6, 17.6]),
+        ("line", [4.5, 19.5, 8.0, 19.0]),
+    ],
+    "text": [
+        ("line", [5, 6, 19, 6]),
+        ("line", [12, 6, 12, 19]),
+        ("line", [8.5, 19, 15.5, 19]),
+    ],
+    "image": [
+        ("rect", (3.5, 5, 17, 14, 2.2)),
+        ("dot", (8.2, 9.4, 1.35)),
+        ("poly", [5.2, 17.3, 10.0, 12.2, 13.2, 15.4, 16.6, 11.6, 20.3, 17.0]),
+    ],
+    "cursor": [
+        ("poly", [5.5, 3.5, 18.2, 11.4, 12.4, 12.8, 9.8, 19.3]),
+        ("line", [12.4, 12.8, 18.2, 11.4]),
+    ],
+    "undo": [
+        ("arc", (12, 12, 6.8, 20, 320, 1)),
+        ("poly", [(6.7, 3.3), (5.3, 8.1), (10.0, 8.3)]),
+    ],
+    "redo": [
+        ("arc", (12, 12, 6.8, 40, 340, 1)),
+        ("poly", [(17.3, 3.3), (18.7, 8.1), (14.0, 8.3)]),
+    ],
+    "zoom_in": [
+        ("arc", (10.5, 10.5, 6.1, 0, 360)),
+        ("line", [15.1, 15.1, 20.0, 20.0]),
+        ("line", [10.5, 7.7, 10.5, 13.3]),
+        ("line", [7.7, 10.5, 13.3, 10.5]),
+    ],
+    "zoom_out": [
+        ("arc", (10.5, 10.5, 6.1, 0, 360)),
+        ("line", [15.1, 15.1, 20.0, 20.0]),
+        ("line", [7.7, 10.5, 13.3, 10.5]),
+    ],
+    "fit": [
+        ("rect", (4.5, 5.5, 15, 13, 1.8)),
+        ("poly", [(8.2, 9.2), (11.0, 12.0), (8.2, 14.8)]),
+        ("poly", [(15.8, 9.2), (13.0, 12.0), (15.8, 14.8)]),
+    ],
+    "layers": [
+        ("poly", [12, 3.8, 20, 8.2, 12, 12.6, 4, 8.2]),
+        ("poly", [4, 12.2, 12, 16.6, 20, 12.2]),
+        ("poly", [4, 16.2, 12, 20.6, 20, 16.2]),
+    ],
 }
 
 
@@ -612,7 +660,7 @@ QPushButton#SegmentItem:checked {{
 }}
 
 /* ---------- inputs ---------- */
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox {{
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox {{
     background: {SURFACE};
     border: 1px solid {BORDER_STRONG};
     border-radius: 10px;
@@ -622,14 +670,16 @@ QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox {{
     selection-background-color: {ACCENT_SOFT};
     selection-color: {ACCENT};
 }}
-QLineEdit:hover, QPlainTextEdit:hover, QSpinBox:hover {{
+QLineEdit:hover, QPlainTextEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {{
     border-color: {css(mix(BORDER_STRONG, TEXT_SUBTLE, 0.4))};
 }}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus {{
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus,
+QDoubleSpinBox:focus {{
     border-color: {ACCENT};
     background: {SURFACE};
 }}
-QLineEdit:disabled, QPlainTextEdit:disabled, QSpinBox:disabled {{
+QLineEdit:disabled, QPlainTextEdit:disabled, QSpinBox:disabled,
+QDoubleSpinBox:disabled {{
     background: {SURFACE_SUNKEN};
     color: {TEXT_SUBTLE};
 }}
@@ -646,9 +696,100 @@ QLineEdit#Search:focus {{
     background: {SURFACE};
     border-color: {ACCENT};
 }}
-QSpinBox::up-button, QSpinBox::down-button {{
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
     width: 0;
     border: none;
+}}
+
+/* ---------- combo boxes ---------- */
+QComboBox {{
+    background: {SURFACE};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 10px;
+    color: {TEXT};
+    font-size: 12px;
+    font-weight: 500;
+    padding: 8px 30px 8px 11px;
+    min-height: 18px;
+}}
+QComboBox:hover {{
+    border-color: {css(mix(BORDER_STRONG, TEXT_SUBTLE, 0.4))};
+}}
+QComboBox:focus {{
+    border-color: {ACCENT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 26px;
+}}
+QComboBox QAbstractItemView {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    color: {TEXT};
+    font-size: 12px;
+    padding: 4px;
+    selection-background-color: {ACCENT_SOFT};
+    selection-color: {ACCENT};
+    outline: none;
+}}
+
+/* ---------- page editor ---------- */
+QWidget#Inspector {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS_LG}px;
+}}
+QPushButton#ToolToggle {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    color: {TEXT_MUTED};
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px 11px;
+}}
+QPushButton#ToolToggle:hover {{
+    background: {SURFACE_ALT};
+    color: {TEXT};
+}}
+QPushButton#ToolToggle:checked {{
+    background: {ACCENT_SOFT};
+    border-color: {css(ACCENT, 0.22)};
+    color: {ACCENT};
+}}
+QListWidget#PageRail {{
+    background: {SURFACE_SUNKEN};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+    padding: 5px;
+    outline: none;
+}}
+QListWidget#PageRail::item {{
+    border: 1px solid transparent;
+    border-radius: 9px;
+    color: {TEXT_SUBTLE};
+    font-size: 10px;
+    font-weight: 600;
+    padding: 3px;
+}}
+QListWidget#PageRail::item:hover {{
+    background: {SURFACE_ALT};
+    border-color: {BORDER};
+}}
+QListWidget#PageRail::item:selected {{
+    background: {ACCENT_SOFT};
+    border-color: {css(ACCENT, 0.50)};
+    color: {ACCENT};
+}}
+QScrollArea#EditorScroll {{
+    background: {SURFACE_ALT};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+}}
+QScrollArea#EditorScroll > QWidget > QWidget {{
+    background: transparent;
 }}
 
 /* ---------- lists ---------- */

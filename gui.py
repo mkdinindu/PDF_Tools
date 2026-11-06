@@ -6,10 +6,12 @@ Run with ``python3 PDF_Tools.py --gui`` (or ``python3 gui.py``).
 
 from __future__ import annotations
 
+import copy
 import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from PyQt6.QtCore import (
     QSize,
     Qt,
     QThreadPool,
+    QTimer,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -37,13 +40,23 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QScrollArea,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 import pdf_core as core
+import pdf_editor_core as editor
 import theme as T
+from editor_widgets import (
+    EditorCanvas,
+    EditorInspector,
+    PageRail,
+    RenderWorker,
+    ThumbnailWorker,
+    tool_toggle,
+)
 from widgets import (
     Badge,
     Button,
@@ -1598,9 +1611,622 @@ class MetadataPanel(ToolPanel):
                                 result.size_text, 0, result.output)
 
 
+class EditorPanel(ToolPanel):
+    """Visual page editor for text and images, with Sinhala-aware shaping."""
+
+    icon = "edit"
+    title = "Edit page"
+    subtitle = ("Change text and pictures on a page - Sinhala is shaped correctly, "
+                "not just swapped glyph by glyph.")
+    action_label = "Save edited PDF"
+    action_icon = "check"
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._sessions: dict[str, "EditorSession"] = {}
+        self._session: EditorSession | None = None
+        self._render_token = 0
+        self._render_worker = None
+        self._rail_worker = None
+        self._change_tag = ""
+        self._last_render_error = ""
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(110)
+        self._render_timer.timeout.connect(self._render_now)
+        self._change_timer = QTimer(self)
+        self._change_timer.setSingleShot(True)
+        self._change_timer.timeout.connect(self._clear_change_tag)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        self.using = UsingBar("edit", "No file selected in the top bar.",
+                              self._browse_source)
+        layout.addWidget(self.using)
+
+        self.workspace = Card(pad=12)
+        self.workspace.add_layout(self._build_toolbar())
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(8)
+
+        self.rail = PageRail()
+        self.rail.page_selected.connect(self._open_page)
+        self.splitter.addWidget(self.rail)
+
+        self.canvas = EditorCanvas()
+        self.canvas.selection_changed.connect(self._on_selection)
+        self.canvas.before_change.connect(self._begin_change)
+        self.canvas.changed.connect(self._on_canvas_changed)
+        self.canvas.committed.connect(self._on_canvas_commit)
+        self.canvas.zoom_delta.connect(self._zoom_by)
+        self.canvas.set_placeholder(
+            "Open a PDF in the top bar, then click a line of text or an image.\n"
+            "Pick the Text tool to draw a new text box.")
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("EditorScroll")
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        self.scroll.setWidget(self.canvas)
+        self.splitter.addWidget(self.scroll)
+
+        self.inspector = EditorInspector()
+        self.inspector.begin_change.connect(self._begin_change)
+        self.inspector.changed.connect(self._on_inspector_changed)
+        self.inspector.delete_requested.connect(self._delete_selected)
+        self.inspector.replace_image_requested.connect(self._replace_image)
+        self.splitter.addWidget(self.inspector)
+
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([136, 620, 286])
+        self.splitter.setMinimumHeight(340)
+        self.workspace.add(self.splitter, 1)
+        layout.addWidget(self.workspace, 1)
+
+        bottom = Card(pad=14)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self.output = FieldRow("Save as", "notes_edited.pdf", "")
+        self.output.browse.clicked.connect(self._choose_output)
+        row.addWidget(self.output, 1)
+        self.save = primary_button(self.action_label, self.action_icon, self._save,
+                                   "Write the changes to a new PDF")
+        row.addWidget(self.save, 0, Qt.AlignmentFlag.AlignBottom)
+        bottom.add_layout(row)
+        layout.addWidget(bottom)
+
+        self.result = ResultCard()
+        layout.addWidget(self.result)
+
+        self._install_canvas_shortcuts()
+        if not editor.available():
+            self.canvas.set_placeholder(
+                "The page editor needs PyMuPDF.\n\n"
+                "Install it with:  python3 -m pip install PyMuPDF\n"
+                "then reopen this tab.")
+        self._sync()
+
+    # -- construction ---------------------------------------------------
+    def _build_toolbar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        bar.setContentsMargins(2, 0, 2, 0)
+        bar.setSpacing(6)
+
+        self.select_tool = tool_toggle(
+            "Select", "cursor", lambda _=False: self._set_tool("select"), True,
+            "Select, move, resize or rotate")
+        self.text_tool = tool_toggle(
+            "Text", "text", lambda _=False: self._set_tool("text"), False,
+            "Drag on the page to add a text box — Sinhala typing works here")
+        self.image_button = soft_button("Add image", "image", self._add_image,
+                                        "Place an image on the current page")
+        bar.addWidget(self.select_tool)
+        bar.addWidget(self.text_tool)
+        bar.addWidget(self.image_button)
+
+        bar.addSpacing(8)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Plain)
+        separator.setStyleSheet(f"color: {T.BORDER};")
+        separator.setFixedHeight(24)
+        bar.addWidget(separator)
+        bar.addSpacing(2)
+
+        self.undo_button = icon_button("undo", self.undo, "Undo (Ctrl+Z)")
+        self.redo_button = icon_button("redo", self.redo, "Redo (Ctrl+Y)")
+        bar.addWidget(self.undo_button)
+        bar.addWidget(self.redo_button)
+        bar.addStretch(1)
+
+        self.prev_page = icon_button("arrow_left", lambda: self._step_page(-1),
+                                     "Previous page")
+        self.page_badge = Badge("0 / 0", "neutral")
+        self.next_page = icon_button("arrow_right", lambda: self._step_page(1),
+                                     "Next page")
+        bar.addWidget(self.prev_page)
+        bar.addWidget(self.page_badge)
+        bar.addWidget(self.next_page)
+        bar.addSpacing(8)
+
+        bar.addWidget(icon_button("zoom_out", lambda: self._zoom_by(-1), "Zoom out"))
+        self.zoom_label = label("100%", 12, 600, T.TEXT_MUTED)
+        self.zoom_label.setFixedWidth(42)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar.addWidget(self.zoom_label)
+        bar.addWidget(icon_button("zoom_in", lambda: self._zoom_by(1), "Zoom in"))
+        bar.addWidget(ghost_button("1:1", "", lambda: self._set_zoom(1.0),
+                                   "Actual size"))
+        bar.addWidget(icon_button("fit", self._fit_view, "Fit page to the window"))
+        return bar
+
+    def _install_canvas_shortcuts(self) -> None:
+        QShortcut(QKeySequence.StandardKey.Undo, self.canvas, activated=self.undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self.canvas, activated=self.redo)
+        QShortcut(QKeySequence("Ctrl+Y"), self.canvas, activated=self.redo)
+
+    # -- source handling ------------------------------------------------
+    def _refresh_source(self) -> None:
+        info = self.info
+        new_path = str(info.path) if info is not None else ""
+        current = self._session.path if self._session is not None else ""
+
+        if not editor.available():
+            self._detach_session()
+            self._clear_view()
+            self.using.set_info(info)
+            self.using.set_detail("Install PyMuPDF to use the page editor.")
+            return
+
+        if new_path and new_path == current:
+            self.using.set_info(info)
+            self._update_using()
+            return
+
+        self._detach_session()
+        if not new_path:
+            self._clear_view()
+            self.using.set_info(None)
+            self.using.set_detail("Pick a file in the top bar to edit a page.")
+            return
+
+        session = self._sessions.get(new_path)
+        if session is None:
+            session = EditorSession(path=new_path, pages=max(1, info.pages))
+            session.output = f"{Path(new_path).stem}_edited.pdf"
+            self._sessions[new_path] = session
+        self._session = session
+        self.using.set_info(info)
+        self.rail.set_pages(session.pages)
+        if session.thumbs:
+            self.rail.set_thumbs(new_path, session.thumbs)
+        else:
+            self._load_thumbs()
+        self.output.set_text(session.output)
+        self._open_page(session.page, initial=True)
+        self._update_using()
+
+    def _detach_session(self) -> None:
+        self.canvas.commit_inline()
+        self._render_timer.stop()
+        self._render_token += 1
+        self._session = None
+
+    def _clear_view(self) -> None:
+        self.rail.clear()
+        self.canvas.clear_render()
+        self.canvas.set_placeholder(
+            "Open a PDF in the top bar, then click a line of text or an image.")
+        self.inspector.show_object(None, "")
+        self.page_badge.setText("0 / 0")
+        self.save.setEnabled(False)
+        self._set_tool_buttons("select")
+        self._sync_tools()
+
+    def _load_thumbs(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        worker = ThumbnailWorker(session.path)
+        self._rail_worker = worker
+        worker.signals.ready.connect(self._on_thumbs)
+        worker.signals.failed.connect(lambda _msg: None)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_thumbs(self, path: str, images) -> None:
+        session = self._sessions.get(path)
+        if session is None:
+            return
+        session.thumbs = list(images or [])
+        if self._session is session:
+            self.rail.set_thumbs(path, session.thumbs)
+
+    # -- pages ----------------------------------------------------------
+    def _open_page(self, index: int, initial: bool = False) -> None:
+        session = self._session
+        if session is None or not (0 <= index < session.pages):
+            return
+        self.canvas.commit_inline()
+        if index not in session.states:
+            try:
+                data = editor.page_data(session.path, index)
+            except Exception as exc:  # noqa: BLE001
+                self.window.toasts.notify("Could not open page", str(exc), "error", 6000)
+                return
+            session.states[index] = editor.PageState.from_page_data(data)
+            session.sizes[index] = (data.width, data.height)
+        session.page = index
+        self.canvas.set_state(session.states[index])
+        size = session.sizes.get(index)
+        if size:
+            self.canvas.set_page_size(*size)
+        self.canvas.select("")
+        self.rail.set_current(index)
+        self.inspector.show_object(None, session.path)
+        self.page_badge.setText(f"{index + 1} / {session.pages}")
+        self._sync_tools()
+        if initial:
+            QTimer.singleShot(0, self._fit_view)
+        self._request_render(immediate=True)
+
+    def _step_page(self, delta: int) -> None:
+        if self._session is None:
+            return
+        self._open_page(self._session.page + int(delta))
+
+    # -- rendering ------------------------------------------------------
+    def _request_render(self, immediate: bool = False) -> None:
+        if self._session is None:
+            return
+        if immediate:
+            self._render_timer.stop()
+            self._render_now()
+        else:
+            self._render_timer.start()
+
+    def _render_now(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        state = session.states.get(session.page)
+        snapshot = copy.deepcopy(state) if state is not None else None
+        self._render_token += 1
+        token = self._render_token
+        worker = RenderWorker(token, session.path, session.page, session.zoom, snapshot)
+        self._render_worker = worker
+        worker.signals.ready.connect(self._render_ready)
+        worker.signals.failed.connect(self._render_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _render_ready(self, token: int, result) -> None:
+        session = self._session
+        if session is None or token != self._render_token:
+            return
+        self._last_render_error = ""
+        self.canvas.set_render(result.png, result.width, result.height,
+                               result.page_width, result.page_height, session.zoom)
+
+    def _render_failed(self, token: int, message: str) -> None:
+        if token != self._render_token or message == self._last_render_error:
+            return
+        self._last_render_error = message
+        self.window.toasts.notify("Could not render the page", message, "error", 5000)
+
+    # -- zoom -----------------------------------------------------------
+    def _set_zoom(self, value: float) -> None:
+        session = self._session
+        if session is None:
+            return
+        session.zoom = max(0.15, min(5.0, float(value)))
+        self.canvas.set_zoom(session.zoom)
+        self.zoom_label.setText(f"{round(session.zoom * 100)}%")
+        self._request_render(immediate=True)
+
+    def _zoom_by(self, direction: int) -> None:
+        session = self._session
+        if session is None:
+            return
+        factor = 1.18 if direction > 0 else 1 / 1.18
+        self._set_zoom(session.zoom * factor)
+
+    def _fit_view(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        size = session.sizes.get(session.page)
+        if not size:
+            return
+        viewport = self.scroll.viewport().size()
+        avail_w = viewport.width() - 48
+        avail_h = viewport.height() - 48
+        if avail_w < 80 or avail_h < 80:
+            QTimer.singleShot(60, self._fit_view)
+            return
+        zoom = min(avail_w / max(1.0, size[0]), avail_h / max(1.0, size[1]))
+        self._set_zoom(max(0.15, min(3.0, zoom)))
+
+    # -- tools and selection --------------------------------------------
+    def _set_tool(self, tool: str) -> None:
+        self._set_tool_buttons(tool)
+        self.canvas.set_tool(tool)
+        if tool == "text":
+            self.canvas.setFocus()
+            self.window.hint_bar("Drag on the page to size a new text box", "info")
+        else:
+            self.window.hint_bar("")
+
+    def _set_tool_buttons(self, tool: str) -> None:
+        self.select_tool.setChecked(tool == "select")
+        self.text_tool.setChecked(tool == "text")
+
+    def _on_selection(self, key: str) -> None:
+        session = self._session
+        if session is None:
+            self.inspector.show_object(None, "")
+            return
+        state = session.states.get(session.page)
+        obj = state.find(key) if state is not None and key else None
+        self.inspector.show_object(obj, session.path)
+
+    def _refresh_inspector(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        obj = self.canvas.selected_object()
+        self.inspector.show_object(obj, session.path)
+
+    def _on_canvas_changed(self) -> None:
+        self.canvas.update()
+        self._request_render()
+        self._sync_tools()
+
+    def _on_canvas_commit(self, _reason: str) -> None:
+        self._refresh_inspector()
+        self._refresh_marks()
+        self._update_using()
+        self._request_render(immediate=True)
+
+    def _on_inspector_changed(self) -> None:
+        self.canvas.update()
+        self._request_render()
+        self._refresh_marks()
+        self._update_using()
+        self._sync_tools()
+
+    def _delete_selected(self) -> None:
+        self.canvas.delete_selected()
+
+    # -- adding content -------------------------------------------------
+    def _add_image(self) -> None:
+        session = self._session
+        if session is None:
+            self.window.toasts.notify("Open a PDF first",
+                                      "Pick a file in the top bar", "warning")
+            return
+        self.canvas.commit_inline()
+        suffixes = " ".join(f"*{ext}" for ext in sorted(core.IMAGE_SUFFIXES))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an image", self.window.last_dir(),
+            f"Images ({suffixes});;All files (*)")
+        if not path:
+            return
+        width, height = editor.image_dimensions(path)
+        page_w, page_h = session.sizes.get(session.page, (595.0, 842.0))
+        if width > 0 and height > 0:
+            scale = min((page_w * 0.55) / width, (page_h * 0.45) / height, 1.0)
+            draw_w = max(24.0, width * scale)
+            draw_h = max(24.0, height * scale)
+        else:
+            draw_w, draw_h = page_w * 0.45, page_h * 0.35
+        left = (page_w - draw_w) / 2
+        top = (page_h - draw_h) / 2
+        self._begin_change("add-image")
+        state = session.states.get(session.page)
+        if state is None:
+            return
+        obj = state.add_image((left, top, left + draw_w, top + draw_h),
+                              path, width, height, keep_proportion=True)
+        self.canvas.select(obj.key)
+        self.inspector.show_object(obj, session.path)
+        self._refresh_marks()
+        self._update_using()
+        self._request_render(immediate=True)
+        self._sync_tools()
+
+    def _replace_image(self) -> None:
+        obj = self.canvas.selected_object()
+        if not isinstance(obj, editor.ImageObject):
+            return
+        suffixes = " ".join(f"*{ext}" for ext in sorted(core.IMAGE_SUFFIXES))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Replace image", self.window.last_dir(),
+            f"Images ({suffixes});;All files (*)")
+        if not path:
+            return
+        self._begin_change("replace-image")
+        width, height = editor.image_dimensions(path)
+        obj.replacement_path = path
+        obj.width = width or obj.width
+        obj.height = height or obj.height
+        self.inspector.show_object(obj, self._session.path if self._session else "")
+        self._refresh_marks()
+        self._update_using()
+        self._request_render(immediate=True)
+
+    # -- history --------------------------------------------------------
+    def _snapshot(self):
+        if self._session is None:
+            return {}
+        return {n: copy.deepcopy(state) for n, state in self._session.states.items()}
+
+    def _begin_change(self, tag: str) -> None:
+        if self._session is None:
+            return
+        if tag == self._change_tag and self._change_timer.isActive():
+            return
+        self._session.history.append(self._snapshot())
+        if len(self._session.history) > 80:
+            self._session.history.pop(0)
+        self._session.future.clear()
+        self._change_tag = tag
+        self._change_timer.start(1200)
+        self._sync_tools()
+
+    def _clear_change_tag(self) -> None:
+        self._change_tag = ""
+
+    def undo(self) -> None:
+        session = self._session
+        if session is None or not session.history:
+            return
+        self.canvas.commit_inline()
+        session.future.append(self._snapshot())
+        session.states = session.history.pop()
+        self._after_history()
+
+    def redo(self) -> None:
+        session = self._session
+        if session is None or not session.future:
+            return
+        self.canvas.commit_inline()
+        session.history.append(self._snapshot())
+        session.states = session.future.pop()
+        self._after_history()
+
+    def _after_history(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        self._change_tag = ""
+        self._change_timer.stop()
+        self._render_token += 1
+        state = session.states.get(session.page)
+        if state is None:
+            self._open_page(session.page)
+        else:
+            self.canvas.set_state(state)
+            self.canvas.select("")
+            self.inspector.show_object(None, session.path)
+            self._request_render(immediate=True)
+        self._refresh_marks()
+        self._update_using()
+        self._sync_tools()
+
+    # -- saving ---------------------------------------------------------
+    def _choose_output(self) -> None:
+        suggested = self.output.text() or "edited.pdf"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save edited PDF", str(Path(self.window.last_dir()) / suggested),
+            "PDF files (*.pdf)")
+        if path:
+            self.output.set_text(path)
+            if self._session is not None:
+                self._session.output = path
+
+    def _save(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        if not session.modified():
+            self.window.toasts.notify("Nothing to save", "Make a change first", "info")
+            return
+        self.canvas.commit_inline()
+        target = self.output.text().strip()
+        if not target:
+            self._choose_output()
+            target = self.output.text().strip()
+            if not target:
+                return
+        session.output = target
+        states = {n: copy.deepcopy(state) for n, state in session.states.items()
+                  if state.has_changes}
+        self.result.hide_result()
+        self.run_job(editor.save_edits, session.path, target, states,
+                     title="Saved", on_done=self._on_saved)
+
+    def _on_saved(self, result) -> None:
+        if self._session is not None:
+            self._session.output = str(result.output)
+        self.result.show_result(f"Created {result.output.name}", result.detail,
+                                result.size_text, result.saved, result.output)
+
+    # -- status ---------------------------------------------------------
+    def _refresh_marks(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        for index in range(session.pages):
+            state = session.states.get(index)
+            self.rail.set_modified(index, bool(state and state.has_changes))
+
+    def _update_using(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        edited = sum(1 for state in session.states.values() if state.has_changes)
+        if edited:
+            detail = (f"{session.pages} pages  ·  {edited} page"
+                      f"{'s' if edited != 1 else ''} with unsaved changes")
+        else:
+            detail = f"{session.pages} pages  ·  select text or an image to edit it"
+        self.using.set_detail(detail)
+
+    def _sync_tools(self) -> None:
+        session = self._session
+        has = session is not None
+        self.undo_button.setEnabled(has and bool(session.history))
+        self.redo_button.setEnabled(has and bool(session.future))
+        self.prev_page.setEnabled(has and session.page > 0)
+        self.next_page.setEnabled(has and session.page < session.pages - 1)
+        self.select_tool.setEnabled(has)
+        self.text_tool.setEnabled(has)
+        self.image_button.setEnabled(has)
+        self.save.setEnabled(has and session.modified())
+
+    def _sync(self) -> None:
+        session = self._session
+        has = session is not None
+        self.output.setEnabled(has)
+        self._sync_tools()
+        if session is not None:
+            zoom = round(session.zoom * 100)
+            self.zoom_label.setText(f"{zoom}%")
+            self.page_badge.setText(f"{session.page + 1} / {session.pages}")
+        else:
+            self.zoom_label.setText("100%")
+            self.page_badge.setText("0 / 0")
+
+
+@dataclass
+class EditorSession:
+    """Edits and view state kept while the app is open, one per document."""
+
+    path: str
+    pages: int
+    states: dict[int, editor.PageState] = field(default_factory=dict)
+    sizes: dict[int, tuple[float, float]] = field(default_factory=dict)
+    history: list[dict[int, editor.PageState]] = field(default_factory=list)
+    future: list[dict[int, editor.PageState]] = field(default_factory=list)
+    page: int = 0
+    zoom: float = 1.0
+    thumbs: list | None = None
+    output: str = ""
+
+    def modified(self) -> bool:
+        return any(state.has_changes for state in self.states.values())
+
+
 # ---------------------------------------------------------------- window
 TOOLS = [
     ("Workspace", "merge", "Merge PDFs", MergePanel),
+    ("Workspace", "edit", "Edit page", EditorPanel),
     ("Documents", "split", "Split", SplitPanel),
     ("Documents", "compress", "Compress", CompressPanel),
     ("Documents", "rotate", "Rotate", RotatePanel),

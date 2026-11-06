@@ -18,6 +18,13 @@ but recommended — with it installed, compression is noticeably better and the
 app reports "Ghostscript ready" in the sidebar. Without it, compression falls
 back to re-encoding embedded images.
 
+The page editor uses [PyMuPDF](https://pymupdf.readthedocs.io/). It is installed
+by `requirements.txt`; if you install packages by hand, add `PyMuPDF`.
+
+```bash
+python3 -m pip install PyMuPDF
+```
+
 ## Desktop app
 
 ```bash
@@ -45,6 +52,7 @@ different one — no re-uploading, no re-picking.
 | Tool | What it does |
 | --- | --- |
 | **Merge PDFs** | Combine every loaded file, in the order shown in the bar |
+| **Edit page** | Change or delete existing text, add new text, and move, resize, rotate or replace images — including shaped Sinhala |
 | **Split** | Extract a page range, or cut into chunks of N pages |
 | **Compress** | Three levels, each reported with the size actually saved |
 | **Rotate** | All pages or a chosen range, 90/180/270° |
@@ -53,9 +61,38 @@ different one — no re-uploading, no re-picking.
 | **Metadata** | Title, author, subject and keywords |
 
 Output names are filled in for you (`notes.pdf` → `notes_compressed.pdf`), so
-switching files updates the target too. `Ctrl+1` … `Ctrl+7` switch tools,
+switching files updates the target too. `Ctrl+1` … `Ctrl+8` switch tools,
 `Ctrl+Q` quits. Long jobs run on a background thread with a progress bar, so the
 window stays responsive.
+
+### Edit page: text and images
+
+The editor is visual and non-destructive: every change is stored in memory and
+written to a new PDF only when you press **Save edited PDF**.
+
+- **Edit text** — click a line, or double-click it to type directly on the page.
+  The inspector also lets you change the content, font, size, colour and
+  alignment. Empty a line to remove it.
+- **Add text** — choose the **Text** tool, then drag a box on the page. New text
+  uses the bundled Sinhala font by default and can be switched to any installed
+  face in the inspector.
+- **Delete** — select the object and press `Delete`, or use the inspector button.
+- **Images** — click an image to select it. Drag it to move, use the corner or
+  edge handles to resize, and the round handle above it to rotate in 15° steps.
+  The inspector can replace the image, flip the aspect-ratio lock, or delete it.
+- **Undo / redo** — `Ctrl+Z` and `Ctrl+Y`, or the toolbar arrows. Each document
+  keeps its own edits while it stays loaded, so switching chips does not lose
+  work.
+- **Zoom** — `Ctrl`+wheel, the toolbar buttons, `1:1`, or **Fit**.
+
+Redaction is used to remove the original text or image cleanly, so backgrounds,
+rules and other page graphics are preserved. New text is laid out through
+MuPDF's HTML/Story engine with `NotoSansSinhala-Regular.ttf` (and the bold face),
+which means complex scripts are shaped correctly — pre-base vowels are
+reordered, conjuncts and ligatures form, and Latin falls back gracefully.
+
+If PyMuPDF is missing, the rest of the app still works; the editor tab explains
+how to install it.
 
 ### Organise: build the page order by hand
 
