@@ -25,6 +25,70 @@ by `requirements.txt`; if you install packages by hand, add `PyMuPDF`.
 python3 -m pip install PyMuPDF
 ```
 
+## Packaging with PyInstaller
+
+```bash
+python3 -m pip install pyinstaller
+pyinstaller --noconfirm --clean gui.spec
+```
+
+To choose the executable name, set `APP_NAME` for the build:
+
+```bash
+# Linux / macOS
+APP_NAME="PDF Tools" pyinstaller --noconfirm --clean gui.spec
+
+# Windows PowerShell
+$env:APP_NAME="PDF Tools"; pyinstaller --noconfirm --clean gui.spec
+```
+
+The result is a single executable (`dist/gui`, or `dist/PDF Tools` above).
+`gui.spec` bundles
+`assets/fonts` and `assets/legacy` into it automatically, so the Sinhala editor
+and the legacy-font mappings work on a machine that does not have this source
+tree. PyInstaller unpacks those files to a temporary folder at startup, which is
+why `legacy_sinhala` and the editor resolve them relative to the running code.
+
+### Ghostscript in the built app
+
+Ghostscript is optional. When it is missing the app still works:
+
+- **Compress** falls back to re-encoding embedded images with Pillow/pypdf.
+- **Organise** thumbnails fall back to PyMuPDF, which is already bundled.
+- The sidebar simply reports that Ghostscript was not found.
+
+Ghostscript only improves compression, so you have three choices:
+
+1. **Ship without it.** Nothing to do; this is the simplest option and the app
+   runs on any system that can run the PyInstaller build.
+2. **Install it on the target machine.** `ghostscript` on Linux/macOS, the
+   official installer on Windows. The app finds `gs`, `gswin64c` and
+   `gswin32c`, and also looks in `C:\Program Files\gs\gs*\bin`.
+3. **Bundle it with the app.** Put a complete Ghostscript tree under
+   `assets/ghostscript/` before building, for example:
+
+   ```text
+   assets/ghostscript/bin/gswin64c.exe
+   assets/ghostscript/bin/gswin64c.dll
+   assets/ghostscript/lib/...
+   ```
+
+   `gui.spec` includes that folder when it exists, and `ghostscript_path()`
+   looks for `assets/ghostscript/bin/gswin64c.exe` (and `gs`,
+   `gswin32c`, ...). You can also point at an external copy with the
+   `PDF_TOOLS_GHOSTSCRIPT` environment variable.
+
+Bundling is most reliable on Windows, where the DLLs sit beside
+`gswin64c.exe`. On Linux and macOS the binary also needs its shared libraries;
+either bundle a fully self-contained build or install Ghostscript on the target
+system.
+
+> **Ghostscript licence.** Ghostscript is distributed under the **AGPL-3.0**
+> (or a commercial licence from Artifex). If you redistribute it inside your
+> app you must comply with the AGPL — including offering the corresponding
+> source — or obtain a commercial licence. Shipping without Ghostscript avoids
+> this entirely.
+
 ## Desktop app
 
 ```bash

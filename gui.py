@@ -35,6 +35,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -175,22 +176,26 @@ class Thumbnailer(QRunnable):
                 pass
 
         gs = core.ghostscript_path()
-        if not gs:
-            self.signals.ready.emit(self.row, None)
-            return
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
-            args = [
-                gs, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dQUIET",
-                "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
-                "-dInterpolateControl=-1", "-dAutoRotatePages=/None",
-                "-dFirstPage=%d" % (self.index + 1), "-dLastPage=%d" % (self.index + 1),
-                "-sDEVICE=png16m", "-r96",
-                "-g1000x1400", "-dPDFFitPage",
-                f"-sOutputFile={cache_file}", self.path,
-            ]
-            subprocess.run(args, capture_output=True, timeout=40)
+            if gs:
+                args = [
+                    gs, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dQUIET",
+                    "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
+                    "-dInterpolateControl=-1", "-dAutoRotatePages=/None",
+                    "-dFirstPage=%d" % (self.index + 1), "-dLastPage=%d" % (self.index + 1),
+                    "-sDEVICE=png16m", "-r96",
+                    "-g1000x1400", "-dPDFFitPage",
+                    f"-sOutputFile={cache_file}", self.path,
+                ]
+                subprocess.run(args, capture_output=True, timeout=40)
+            else:
+                # No Ghostscript: PyMuPDF is bundled with the app, so the
+                # Organise grid still gets real page thumbnails.
+                cache_file.write_bytes(editor.render_thumbnail(self.path, self.index, self.width))
         except (subprocess.TimeoutExpired, OSError):
+            pass
+        except Exception:  # noqa: BLE001 - a failed thumbnail must not break the grid
             pass
         if QGuiApplication.instance() is None:
             return
@@ -1663,6 +1668,7 @@ class EditorPanel(ToolPanel):
         self.canvas.changed.connect(self._on_canvas_changed)
         self.canvas.committed.connect(self._on_canvas_commit)
         self.canvas.zoom_delta.connect(self._zoom_by)
+        self.canvas.tool_finished.connect(lambda: self._set_tool("select"))
         self.canvas.set_placeholder(
             "Open a PDF in the top bar, then click a line of text or an image.\n"
             "Pick the Text tool to draw a new text box.")
@@ -1725,10 +1731,25 @@ class EditorPanel(ToolPanel):
         self.text_tool = tool_toggle(
             "Text", "text", lambda _=False: self._set_tool("text"), False,
             "Drag on the page to add a text box — Sinhala typing works here")
+        shape_tip = "Drag on the page to draw a shape (transparent or opaque)"
+        try:
+            self.shape_tool = tool_toggle(
+                "Shape", "shape", lambda _=False: self._set_tool("shape"), False, shape_tip)
+        except Exception:  # noqa: BLE001 - icon set has no "shape" glyph
+            self.shape_tool = tool_toggle(
+                "Shape", "", lambda _=False: self._set_tool("shape"), False, shape_tip)
+        self.shape_kind = QComboBox()
+        self.shape_kind.setMinimumHeight(34)
+        self.shape_kind.setToolTip("Which shape to draw")
+        for kind, title in editor.SHAPE_KINDS:
+            self.shape_kind.addItem(title, kind)
+        self.shape_kind.activated.connect(self._shape_kind_picked)
         self.image_button = soft_button("Add image", "image", self._add_image,
                                         "Place an image on the current page")
         bar.addWidget(self.select_tool)
         bar.addWidget(self.text_tool)
+        bar.addWidget(self.shape_tool)
+        bar.addWidget(self.shape_kind)
         bar.addWidget(self.image_button)
 
         bar.addSpacing(8)
@@ -1862,6 +1883,13 @@ class EditorPanel(ToolPanel):
                 return
             session.states[index] = editor.PageState.from_page_data(data)
             session.sizes[index] = (data.width, data.height)
+            try:
+                problem = editor.legacy.missing_mapping_report()
+            except Exception:  # noqa: BLE001
+                problem = ""
+            if problem:
+                self.window.toasts.notify(
+                    "Sinhala text can't be decoded", problem, "error", 12000)
         session.page = index
         self.canvas.set_state(session.states[index])
         size = session.sizes.get(index)
@@ -1956,15 +1984,24 @@ class EditorPanel(ToolPanel):
     def _set_tool(self, tool: str) -> None:
         self._set_tool_buttons(tool)
         self.canvas.set_tool(tool)
-        if tool == "text":
+        if tool == "shape":
+            self.canvas.set_shape_kind(self.shape_kind.currentData() or "rect")
+            self.canvas.setFocus()
+            self.window.hint_bar("Drag on the page to draw the shape - or just click "
+                                 "for a default size", "info")
+        elif tool == "text":
             self.canvas.setFocus()
             self.window.hint_bar("Drag on the page to size a new text box", "info")
         else:
             self.window.hint_bar("")
 
+    def _shape_kind_picked(self, _index: int) -> None:
+        self._set_tool("shape")
+
     def _set_tool_buttons(self, tool: str) -> None:
         self.select_tool.setChecked(tool == "select")
         self.text_tool.setChecked(tool == "text")
+        self.shape_tool.setChecked(tool == "shape")
 
     def _on_selection(self, key: str) -> None:
         session = self._session
@@ -1994,6 +2031,7 @@ class EditorPanel(ToolPanel):
         self._request_render(immediate=True)
 
     def _on_inspector_changed(self) -> None:
+        self.canvas.remember_shape_style(self.canvas.selected_object())
         self.canvas.update()
         self._request_render()
         self._refresh_marks()
@@ -2175,7 +2213,7 @@ class EditorPanel(ToolPanel):
             detail = (f"{session.pages} pages  ·  {edited} page"
                       f"{'s' if edited != 1 else ''} with unsaved changes")
         else:
-            detail = f"{session.pages} pages  ·  select text or an image to edit it"
+            detail = f"{session.pages} pages  ·  select text, an image or a shape to edit it"
         self.using.set_detail(detail)
 
     def _sync_tools(self) -> None:
@@ -2187,6 +2225,8 @@ class EditorPanel(ToolPanel):
         self.next_page.setEnabled(has and session.page < session.pages - 1)
         self.select_tool.setEnabled(has)
         self.text_tool.setEnabled(has)
+        self.shape_tool.setEnabled(has)
+        self.shape_kind.setEnabled(has)
         self.image_button.setEnabled(has)
         self.save.setEnabled(has and session.modified())
 

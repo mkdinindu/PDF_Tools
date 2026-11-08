@@ -728,6 +728,84 @@ class ImageObject:
                          keep_proportion=self.keep_proportion)
 
 
+#: (kind, label) for every drawable shape.
+SHAPE_KINDS: tuple[tuple[str, str], ...] = (
+    ("rect", "Rectangle"), ("rounded", "Rounded rectangle"),
+    ("ellipse", "Ellipse"), ("triangle", "Triangle"),
+    ("line", "Line"), ("arrow", "Arrow"),
+)
+LINE_KINDS = ("line", "arrow")
+
+
+def line_points(rect, flip: bool = False, reverse: bool = False):
+    """(tail, head) of a line/arrow whose bounding box is *rect*.
+
+    No snapping and no minimum size: a line is exactly what its two end
+    points say.  ``flip`` = runs bottom-left to top-right; ``reverse`` swaps
+    the ends (so an arrow can point left).  Works in any coordinate unit.
+    """
+    x0, y0, x1, y1 = (float(v) for v in rect)
+    left, right = ((x0, y1), (x1, y0)) if flip else ((x0, y0), (x1, y1))
+    return (right, left) if reverse else (left, right)
+
+
+def line_from_points(tail, head):
+    """Inverse of line_points: (rect, flip, reverse) for two end points."""
+    first, second = sorted((tuple(tail), tuple(head)), key=lambda p: (p[0], p[1]))
+    rect = (min(tail[0], head[0]), min(tail[1], head[1]),
+            max(tail[0], head[0]), max(tail[1], head[1]))
+    flip = first[1] > second[1]
+    reverse = tuple(tail) != first
+    if tuple(tail) == tuple(head):
+        reverse = False
+    return rect, flip, reverse
+
+
+def arrow_head(p1, p2, width: float):
+    """(line end, triangle points) for an arrowhead at *p2*."""
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    size = min(max(8.0, float(width) * 4.5), length * 0.8)
+    bx, by = p2[0] - ux * size, p2[1] - uy * size
+    half = size * 0.45
+    left = (bx - uy * half, by + ux * half)
+    right = (bx + uy * half, by - ux * half)
+    return (p2[0] - ux * size * 0.95, p2[1] - uy * size * 0.95), [p2, left, right]
+
+
+@dataclass
+class ShapeObject:
+    """A drawn shape: opaque or transparent fill, outline, any size."""
+
+    key: str
+    kind: str
+    rect: tuple[float, float, float, float]
+    fill: tuple[int, int, int] = (59, 130, 246)
+    fill_opacity: float = 0.35
+    stroke: tuple[int, int, int] = (30, 64, 175)
+    stroke_opacity: float = 1.0
+    stroke_width: float = 2.0
+    flip: bool = False
+    reverse: bool = False
+    deleted: bool = False
+    label: str = ""
+
+    item = None  # shapes are always new; keeps shared code paths simple
+
+    @property
+    def is_new(self) -> bool:
+        return True
+
+    @property
+    def is_changed(self) -> bool:
+        return not self.deleted
+
+    @property
+    def is_line(self) -> bool:
+        return self.kind in LINE_KINDS
+
+
 @dataclass
 class PageState:
     """All editable objects on one page plus their original counterparts."""
@@ -735,6 +813,7 @@ class PageState:
     number: int
     texts: list[TextObject] = field(default_factory=list)
     images: list[ImageObject] = field(default_factory=list)
+    shapes: list[ShapeObject] = field(default_factory=list)
     _new_counter: int = 0
 
     @classmethod
@@ -746,9 +825,17 @@ class PageState:
             state.images.append(ImageObject.from_item(item))
         return state
 
-    def objects(self) -> list[TextObject | ImageObject]:
-        """Images first, then text - matching the usual paint order."""
-        return [*self.images, *self.texts]
+    def objects(self) -> list[TextObject | ImageObject | ShapeObject]:
+        """Images, then shapes, then text - matching the paint order."""
+        return [*self.images, *self.shapes, *self.texts]
+
+    def add_shape(self, kind: str, rect, flip: bool = False,
+                  reverse: bool = False, **style) -> ShapeObject:
+        label = dict(SHAPE_KINDS).get(kind, "Shape")
+        obj = ShapeObject(key=self.next_key("ns"), kind=kind, rect=_rect_tuple(rect),
+                          flip=flip, reverse=reverse, label=label, **style)
+        self.shapes.append(obj)
+        return obj
 
     def find(self, key: str) -> TextObject | ImageObject | None:
         for obj in self.objects():
@@ -779,7 +866,7 @@ class PageState:
         return obj
 
     def remove(self, key: str) -> None:
-        for collection in (self.texts, self.images):
+        for collection in (self.texts, self.images, self.shapes):
             for obj in collection:
                 if obj.key == key:
                     if isinstance(obj, TextObject) and obj.item is not None:
@@ -806,6 +893,8 @@ class PageState:
     @property
     def has_changes(self) -> bool:
         if any(obj.is_changed for obj in self.texts):
+            return True
+        if any(obj.is_changed for obj in self.shapes):
             return True
         return any(obj.is_changed for obj in self.images)
 
@@ -840,6 +929,12 @@ def _extract_text(page) -> list[TextItem]:
         return []
     items: list[TextItem] = []
     seen: set[tuple] = set()
+    # Identify legacy Sinhala fonts from everything on the page first, so
+    # short lines in the same font decode even without tell-tale characters.
+    legacy.learn_fonts(
+        (str(sp.get("text", "")), str(sp.get("font", "")))
+        for blk in data.get("blocks", []) if blk.get("type") == 0
+        for ln in blk.get("lines", []) for sp in ln.get("spans", []))
     for block in data.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -951,6 +1046,22 @@ def render_page(path: str | os.PathLike, index: int, zoom: float = 1.5,
         if state is not None and state.has_changes:
             _apply_page_state(page, state)
         return _render_page_object(page, zoom)
+    finally:
+        doc.close()
+
+
+def render_thumbnail(path: str | os.PathLike, index: int, max_width: int = 110) -> bytes:
+    """Render one page to a small PNG without Ghostscript (the Organise fallback)."""
+    require()
+    doc = _open_doc(path)
+    try:
+        if index < 0 or index >= len(doc):
+            raise EditorError(f"Page {index + 1} does not exist")
+        page = doc[index]
+        width = max(1.0, page.rect.width)
+        zoom = max(0.05, min(1.0, float(max_width) / width))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
     finally:
         doc.close()
 
@@ -1115,11 +1226,70 @@ def _apply_page_state(page, state: PageState) -> list[str]:
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Could not place image: {exc}")
 
+    for shape in state.shapes:
+        if shape.deleted:
+            continue
+        try:
+            _draw_shape(page, shape, page_rect)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not draw a shape: {exc}")
+
     for edit in text_edits:
         if edit.delete or not edit.text.strip():
             continue
         warnings.extend(_insert_text(page, edit, page_rect))
     return warnings
+
+
+def _draw_shape(page, obj: ShapeObject, page_rect) -> None:
+    x0, y0, x1, y1 = _rect_tuple(obj.rect)
+    box = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    width = max(0.0, float(obj.stroke_width))
+    s_op = _clamp(float(obj.stroke_opacity), 0.0, 1.0)
+    f_op = _clamp(float(obj.fill_opacity), 0.0, 1.0)
+    stroke = _rgb_floats(obj.stroke)
+
+    if obj.kind in LINE_KINDS:
+        width = max(0.25, width)
+        if box.width < 0.01 and box.height < 0.01:
+            return
+        p1, p2 = line_points(tuple(box), obj.flip, obj.reverse)
+        end = p2
+        head = None
+        if obj.kind == "arrow":
+            end, head = arrow_head(p1, p2, width)
+        page.draw_line(fitz.Point(*p1), fitz.Point(*end), color=stroke,
+                       width=width, stroke_opacity=s_op, overlay=True)
+        if head:
+            page.draw_polyline([fitz.Point(*pt) for pt in head], color=stroke,
+                               fill=stroke, width=0.1, closePath=True,
+                               stroke_opacity=s_op, fill_opacity=s_op,
+                               overlay=True)
+        return
+
+    if box.width < 0.1 or box.height < 0.1:
+        return
+    fill = _rgb_floats(obj.fill) if f_op > 0.004 else None
+    line = stroke if (width > 0 and s_op > 0.004) else None
+    if fill is None and line is None:
+        return
+    # Keep the outline inside the selection box.
+    inset = width / 2 if line is not None else 0.0
+    inner = fitz.Rect(box.x0 + inset, box.y0 + inset, box.x1 - inset, box.y1 - inset)
+    if inner.width < 1 or inner.height < 1:
+        inner = box
+    common = dict(color=line, fill=fill, width=width if line else 0,
+                  stroke_opacity=s_op, fill_opacity=f_op, overlay=True)
+    if obj.kind == "ellipse":
+        page.draw_oval(inner, **common)
+    elif obj.kind == "triangle":
+        pts = [fitz.Point((inner.x0 + inner.x1) / 2, inner.y0),
+               fitz.Point(inner.x1, inner.y1), fitz.Point(inner.x0, inner.y1)]
+        page.draw_polyline(pts, closePath=True, **common)
+    elif obj.kind == "rounded":
+        page.draw_rect(inner, radius=0.2, **common)
+    else:
+        page.draw_rect(inner, **common)
 
 
 def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
@@ -1141,7 +1311,7 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
 
     size = _clamp(float(edit.font_size or 12.0), 4.0, 300.0)
     rect = _clamp_rect(edit.rect, page_rect)
-    width = max(rect.width, 8.0)
+    width = max(rect.width, size * 1.5, 8.0)
     if edit.baseline_offset is not None:
         # Match the original baseline, not the top of the original bbox.
         top = rect.y0 + float(edit.baseline_offset) - ascender * size - 0.5
@@ -1170,12 +1340,13 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
 
     if arc is not None:
         css = css % arc_name
-        for _attempt in range(4):
+        for _attempt in range(6):
             target = fitz.Rect(rect.x0, top, rect.x0 + width, top + height)
             try:
                 spare, scale = page.insert_htmlbox(
                     target, markup, css=css, archive=arc,
-                    scale_low=0.75, overlay=True)
+                    scale_low=(0.75 if _attempt < 3 else 0.2),
+                    overlay=True)
             except Exception:  # noqa: BLE001
                 break
             if spare >= 0:
@@ -1184,8 +1355,14 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
                 # the same text a second time.
                 return []
             # MuPDF did not insert anything when it cannot fit the text, so
-            # giving the box more room and trying again is safe.
-            height *= 1.8
+            # giving the box more room and trying again is safe.  Widen it
+            # (up to the page edge) before growing it taller, so a narrow
+            # box never makes the text vanish from the preview.
+            room = max(page_rect.x1 - rect.x0, width)
+            if width < room and _attempt < 2:
+                width = min(room, width * 1.7)
+            else:
+                height *= 1.8
             if height > page_rect.height * 2:
                 break
 
@@ -1265,11 +1442,15 @@ def save_edits(input_path: str | os.PathLike, output_path: str | os.PathLike,
 
     text_changes = sum(states[n].counts()[0] for n in edited_pages)
     image_changes = sum(states[n].counts()[1] for n in edited_pages)
+    shape_changes = sum(len([x for x in states[n].shapes if not x.deleted])
+                        for n in edited_pages)
     parts = [f"{len(edited_pages)} page{'s' if len(edited_pages) != 1 else ''} edited"]
     if text_changes:
         parts.append(f"{text_changes} text change{'s' if text_changes != 1 else ''}")
     if image_changes:
         parts.append(f"{image_changes} image change{'s' if image_changes != 1 else ''}")
+    if shape_changes:
+        parts.append(f"{shape_changes} shape{'s' if shape_changes != 1 else ''}")
     if warnings:
         parts.append(warnings[0])
     progress(100, "Done")

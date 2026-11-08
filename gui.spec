@@ -1,11 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+from pathlib import Path
+
+# Override the output name without editing this file:
+#   APP_NAME="PDF Tools" pyinstaller --noconfirm --clean gui.spec
+APP_NAME = os.environ.get("APP_NAME", "gui").strip() or "gui"
+
+# Bundled data files are unpacked next to the code at runtime (sys._MEIPASS in
+# one-file builds), so the editor and legacy_sinhala can resolve them.
+ROOT = Path(SPECPATH)
+datas = [
+    (str(ROOT / 'assets' / 'fonts'), 'assets/fonts'),
+    (str(ROOT / 'assets' / 'legacy'), 'assets/legacy'),
+]
+
+# Optional: drop a platform-specific Ghostscript tree here to ship it with the
+# app.  See README.md - without it the app still works, using PyMuPDF/Pillow.
+_ghostscript = ROOT / 'assets' / 'ghostscript'
+if _ghostscript.is_dir():
+    datas.append((str(_ghostscript), 'assets/ghostscript'))
 
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +42,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='gui',
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

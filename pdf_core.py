@@ -8,10 +8,12 @@ callback and raises :class:`PdfToolError` for anything a user can fix.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -448,8 +450,63 @@ def split_pdf(input_path: str | os.PathLike, output_path: str | os.PathLike,
     raise PdfToolError(f"Unknown split mode: {mode}")
 
 
+def _bundled_ghostscript_candidates() -> list[Path]:
+    """Where a Ghostscript shipped inside the app would live.
+
+    PyInstaller 6 unpacks data files under ``sys._MEIPASS`` in one-file mode and
+    next to the executable in one-dir mode, so search all likely roots.
+    """
+    roots = [Path(__file__).resolve().parent]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+
+    names = ("gs", "gswin64c.exe", "gswin32c.exe", "gswin64c", "gswin32c")
+    subdirs = ("assets/ghostscript/bin", "assets/ghostscript", "ghostscript/bin", "ghostscript")
+    out: list[Path] = []
+    for root in roots:
+        for sub in subdirs:
+            for name in names:
+                out.append(root / sub / name)
+    return out
+
+
 def ghostscript_path() -> str | None:
-    return shutil.which("gs") or shutil.which("ghostscript")
+    """Return a usable Ghostscript executable, or ``None``.
+
+    Search order: an explicit ``PDF_TOOLS_GHOSTSCRIPT`` override, a copy
+    bundled next to the app, the normal ``PATH`` (including the Windows
+    ``gswin64c``/``gswin32c`` names), then standard Windows install folders.
+    """
+    override = os.environ.get("PDF_TOOLS_GHOSTSCRIPT")
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+
+    for candidate in _bundled_ghostscript_candidates():
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    for name in ("gs", "gswin64c", "gswin32c", "ghostscript"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    if os.name == "nt":
+        patterns = (
+            r"C:\Program Files\gs\gs*\bin\gswin64c.exe",
+            r"C:\Program Files\gs\gs*\bin\gswin32c.exe",
+            r"C:\Program Files (x86)\gs\gs*\bin\gswin64c.exe",
+            r"C:\Program Files (x86)\gs\gs*\bin\gswin32c.exe",
+        )
+        for pattern in patterns:
+            matches = sorted(glob.glob(pattern), reverse=True)
+            if matches:
+                return matches[0]
+    return None
 
 
 def compress_pdf(input_path: str | os.PathLike, output_path: str | os.PathLike,
