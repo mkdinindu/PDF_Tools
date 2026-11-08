@@ -66,6 +66,9 @@ from widgets import (
 CANVAS_MARGIN = 30
 HANDLE_SIZE = 8.0
 ROTATE_OFFSET = 26.0
+#: Smallest width/height (PDF points) a box can be resized to.  Anything
+#: tighter wraps text one letter per line and it stops rendering.
+MIN_BOX = 14.0
 
 
 # ------------------------------------------------------------------ workers
@@ -398,12 +401,20 @@ class EditorCanvas(QWidget):
         return QPointF((point.x() - CANVAS_MARGIN) / self._zoom,
                        (point.y() - CANVAS_MARGIN) / self._zoom)
 
-    def _clamp_page_rect(self, rect: QRectF) -> QRectF:
-        left = max(0.0, min(self._page_w - 4.0, rect.left()))
-        top = max(0.0, min(self._page_h - 4.0, rect.top()))
-        right = max(left + 4.0, min(self._page_w, rect.right()))
-        bottom = max(top + 4.0, min(self._page_h, rect.bottom()))
+    def _clamp_page_rect(self, rect: QRectF, minimum: float = 4.0) -> QRectF:
+        left = max(0.0, min(self._page_w - minimum, rect.left()))
+        top = max(0.0, min(self._page_h - minimum, rect.top()))
+        right = max(left + minimum, min(self._page_w, rect.right()))
+        bottom = max(top + minimum, min(self._page_h, rect.bottom()))
         return QRectF(left, top, right - left, bottom - top)
+
+    def _move_page_rect(self, rect: QRectF) -> QRectF:
+        """Slide a box so it stays on the page *without changing its size*."""
+        width = min(rect.width(), self._page_w)
+        height = min(rect.height(), self._page_h)
+        left = max(0.0, min(self._page_w - width, rect.left()))
+        top = max(0.0, min(self._page_h - height, rect.top()))
+        return QRectF(left, top, width, height)
 
     def _handles(self, rect: QRectF) -> dict[str, QPointF]:
         cx = rect.center().x()
@@ -423,9 +434,18 @@ class EditorCanvas(QWidget):
         if obj is None:
             return ""
         rect = self._widget_rect(obj.rect)
+        # On a small box the grab zones would overlap and the first one in
+        # the list used to win.  Shrink the zone with the box and pick the
+        # nearest handle, so clicks inside a small box move it instead.
+        radius = min(HANDLE_SIZE + 4, max(4.0, min(rect.width(), rect.height()) / 2.5))
+        best, best_dist = "", radius + 1
         for name, handle in self._handles(rect).items():
-            if (point - handle).manhattanLength() <= HANDLE_SIZE + 4:
-                return name
+            delta = point - handle
+            dist = math.hypot(delta.x(), delta.y())
+            if dist <= radius and dist < best_dist:
+                best, best_dist = name, dist
+        if best:
+            return best
         if isinstance(obj, ec.ImageObject):
             if (point - self._rotate_point(rect)).manhattanLength() <= HANDLE_SIZE + 5:
                 return "rotate"
@@ -602,7 +622,7 @@ class EditorCanvas(QWidget):
             dy = (point.y() - self._drag["start"].y()) / self._zoom
             x0, y0, x1, y1 = self._drag["orig"]
             rect = QRectF(x0 + dx, y0 + dy, x1 - x0, y1 - y0)
-            rect = self._clamp_page_rect(rect)
+            rect = self._move_page_rect(rect)
             obj.rect = (rect.left(), rect.top(), rect.right(), rect.bottom())
         elif kind == "resize":
             obj.rect = self._resized_rect(obj, point)
@@ -625,13 +645,13 @@ class EditorCanvas(QWidget):
         left, top, right, bottom = x0, y0, x1, y1
 
         if "l" in handle:
-            left = min(x0 + dx, right - 4.0)
+            left = min(x0 + dx, right - MIN_BOX)
         if "r" in handle:
-            right = max(x1 + dx, left + 4.0)
+            right = max(x1 + dx, left + MIN_BOX)
         if "t" in handle:
-            top = min(y0 + dy, bottom - 4.0)
+            top = min(y0 + dy, bottom - MIN_BOX)
         if "b" in handle:
-            bottom = max(y1 + dy, top + 4.0)
+            bottom = max(y1 + dy, top + MIN_BOX)
 
         if isinstance(obj, ec.ImageObject) and obj.keep_proportion and handle in (
                 "tl", "tr", "bl", "br"):
@@ -649,8 +669,8 @@ class EditorCanvas(QWidget):
             top = anchor_y - height if "t" in handle else anchor_y
             bottom = anchor_y + height if "b" in handle else anchor_y
 
-        rect = QRectF(left, top, max(4.0, right - left), max(4.0, bottom - top))
-        return tuple(self._clamp_page_rect(rect).getRect())
+        rect = QRectF(left, top, max(MIN_BOX, right - left), max(MIN_BOX, bottom - top))
+        return tuple(self._clamp_page_rect(rect, MIN_BOX).getRect())
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self._drag is None:

@@ -91,6 +91,15 @@ MuPDF's HTML/Story engine with `NotoSansSinhala-Regular.ttf` (and the bold face)
 which means complex scripts are shaped correctly — pre-base vowels are
 reordered, conjuncts and ligatures form, and Latin falls back gracefully.
 
+PDFs made with legacy Sinhala fonts (FM Abhaya, FM Malithi, DL-Manel, Kaputa,
+Amalee, Thibus) store Sinhala glyphs as ASCII look-alike bytes, so the raw text
+extracts as strings like `o<od ud,s.dj` instead of `දළදා මාලිගාව`. The editor
+recognises those fonts and converts the text back to Unicode while reading the
+page, so the inspector and the in-place text box show real Sinhala. Text that is
+already Unicode is never converted twice, and Latin text in ordinary fonts is
+left as it is. Only the conversion tables are bundled (see `assets/legacy/`),
+not the legacy fonts themselves.
+
 If PyMuPDF is missing, the rest of the app still works; the editor tab explains
 how to install it.
 

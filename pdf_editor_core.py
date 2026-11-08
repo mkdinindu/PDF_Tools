@@ -840,6 +840,12 @@ def _extract_text(page) -> list[TextItem]:
         return []
     items: list[TextItem] = []
     seen: set[tuple] = set()
+    # Identify legacy Sinhala fonts from everything on the page first, so
+    # short lines in the same font decode even without tell-tale characters.
+    legacy.learn_fonts(
+        (str(sp.get("text", "")), str(sp.get("font", "")))
+        for blk in data.get("blocks", []) if blk.get("type") == 0
+        for ln in blk.get("lines", []) for sp in ln.get("spans", []))
     for block in data.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -1141,7 +1147,7 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
 
     size = _clamp(float(edit.font_size or 12.0), 4.0, 300.0)
     rect = _clamp_rect(edit.rect, page_rect)
-    width = max(rect.width, 8.0)
+    width = max(rect.width, size * 1.5, 8.0)
     if edit.baseline_offset is not None:
         # Match the original baseline, not the top of the original bbox.
         top = rect.y0 + float(edit.baseline_offset) - ascender * size - 0.5
@@ -1170,7 +1176,7 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
 
     if arc is not None:
         css = css % arc_name
-        for _attempt in range(4):
+        for _attempt in range(6):
             target = fitz.Rect(rect.x0, top, rect.x0 + width, top + height)
             try:
                 spare, scale = page.insert_htmlbox(
@@ -1184,8 +1190,14 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
                 # the same text a second time.
                 return []
             # MuPDF did not insert anything when it cannot fit the text, so
-            # giving the box more room and trying again is safe.
-            height *= 1.8
+            # giving the box more room and trying again is safe.  Widen it
+            # (up to the page edge) before growing it taller, so a narrow
+            # box never makes the text vanish from the preview.
+            room = max(page_rect.x1 - rect.x0, width)
+            if width < room and _attempt < 2:
+                width = min(room, width * 1.7)
+            else:
+                height *= 1.8
             if height > page_rect.height * 2:
                 break
 
