@@ -1,0 +1,5 @@
+build/* 
+dist/*
+.venv/*
+dist.zip
+__pycache__/*

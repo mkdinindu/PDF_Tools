@@ -1,0 +1,5 @@
+# PDF Tools
+PyQt6>=6.6
+pypdf>=4.0
+pillow>=10.0
+PyMuPDF>=1.24
