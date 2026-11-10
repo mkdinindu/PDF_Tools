@@ -1301,6 +1301,10 @@ def _insert_text(page, edit: TextEdit, page_rect) -> list[str]:
         font_path = default_font_for(text)
     if not font_path or not Path(font_path).exists():
         return ["No font available for the new text"]
+    if not font_covers(font_path, text):
+        candidate = default_font_for(text)
+        if candidate and Path(candidate).exists() and font_covers(candidate, text):
+            font_path = candidate
 
     try:
         face = fitz.Font(fontfile=font_path)

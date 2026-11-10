@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 
 from PyQt6.QtCore import (
+    QEvent,
     QObject,
     QPointF,
     QRectF,
@@ -36,18 +37,22 @@ from PyQt6.QtGui import (
     QPolygonF,
 )
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QComboBox,
     QColorDialog,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
     QSizePolicy,
     QSlider,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -70,6 +75,70 @@ from widgets import (
 CANVAS_MARGIN = 30
 HANDLE_SIZE = 8.0
 ROTATE_OFFSET = 26.0
+
+#: Cache of font-file path -> Qt family name (registering a file is expensive).
+_FONT_FAMILIES: dict[str, str] = {}
+
+
+def font_family_for(path: str) -> str:
+    """Register a font file with Qt and return its family name, or ''.
+
+    The family is used to give the on-canvas editor the same face as the
+    text object instead of relying on an opaque platform fallback.
+    """
+    path = str(path or "")
+    if not path:
+        return ""
+    if path in _FONT_FAMILIES:
+        return _FONT_FAMILIES[path]
+    family = ""
+    if Path(path).is_file():
+        try:
+            font_id = QFontDatabase.addApplicationFont(path)
+            names = (QFontDatabase.applicationFontFamilies(font_id)
+                     if font_id >= 0 else [])
+            family = names[0] if names else ""
+        except Exception:  # noqa: BLE001
+            family = ""
+    _FONT_FAMILIES[path] = family
+    return family
+
+
+def editor_font_families(font_path: str) -> list[str]:
+    """Preferred families for a text editor: object face, Sinhala, then UI."""
+    families: list[str] = []
+    for family in (
+        font_family_for(font_path),
+        font_family_for(ec.default_sinhala_font()),
+        T.ui_font_family(),
+    ):
+        family = (family or "").strip()
+        if family and family not in families:
+            families.append(family)
+    return families
+
+
+def font_family_css(font_path: str) -> str:
+    """A QSS ``font-family`` value with per-glyph fallbacks."""
+    families = editor_font_families(font_path)
+    return ", ".join(f'"{family}"' for family in families)
+
+
+def fit_font_to_text(obj) -> None:
+    """Use a face that can actually draw the object's text.
+
+    New text boxes start with the bundled Sinhala face, which has no Latin
+    glyphs.  MuPDF then substitutes whatever the OS offers for Latin (which
+    is why English could look serif/cursive).  Switching to the matching
+    bundled/system face keeps the preview predictable.
+    """
+    text = str(getattr(obj, "text", "") or "")
+    if not text.strip() or ec.font_covers(getattr(obj, "font_path", ""), text):
+        return
+    candidate = ec.default_font_for(text)
+    if (candidate and candidate != obj.font_path
+            and ec.font_covers(candidate, text)):
+        obj.font_path = candidate
 
 
 # ------------------------------------------------------------------ workers
@@ -235,12 +304,36 @@ class InlineEditor(QPlainTextEdit):
     def __init__(self, text: str, parent: QWidget | None = None):
         super().__init__(parent)
         self._done = False
+        self._closing = False
+        self._app_active = True
+        self._filtering = False
+        self._forwarding = False
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.setInterval(0)
+        self._focus_timer.timeout.connect(self._reclaim_focus)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._filtering = True
         self.setObjectName("InlineEditor")
         self.setPlainText(text)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTabChangesFocus(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+
+    def event(self, event):
+        # QWidget::event turns Tab into a focus move before keyPressEvent is
+        # called.  Catch it here so Tab finishes editing instead of bouncing
+        # focus around on Windows.
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -252,16 +345,155 @@ class InlineEditor(QPlainTextEdit):
             event.accept()
             self._finish(True, self.toPlainText())
             return
+        if event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            # Tab used to move focus, which closed the editor on Windows.
+            # Commit explicitly instead.
+            event.accept()
+            self._finish(True, self.toPlainText())
+            return
         super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonPress:
+            if not (self._closing or self._done) and self.isVisible():
+                app = QApplication.instance()
+                if app is not None and app.activePopupWidget() is not None:
+                    return False
+                target = obj if isinstance(obj, QWidget) else None
+                if target is None:
+                    return False
+                inside = target is self or self.isAncestorOf(target)
+                same_window = target.window() is self.window()
+                if not inside and same_window:
+                    # A click in this window is the real signal that editing
+                    # is done.  Clicks in menus/dialogs/other windows are not.
+                    self._finish(True, self.toPlainText())
+        elif kind == QEvent.Type.KeyPress:
+            return self._forward_escaped_key(obj, event)
+        elif kind == QEvent.Type.ApplicationDeactivate:
+            self._app_active = False
+        elif kind == QEvent.Type.ApplicationActivate:
+            self._app_active = True
+            if not (self._closing or self._done) and self.isVisible():
+                self._focus_timer.start()
+        return False
+
+    def _forward_escaped_key(self, obj, event) -> bool:
+        """Send a key to the editor when Windows moved focus somewhere else.
+
+        Focus reclaim (``_reclaim_focus``) usually runs before the next key,
+        but on Windows the focus can land on a plain container widget and the
+        key would be dropped there.  Forward printable keys and the editing
+        keys instead of losing them.  Shortcuts (Ctrl/Alt/Meta) are left alone
+        so Save/Open/Undo still reach the application.
+        """
+        if (self._forwarding or self._closing or self._done
+                or not self.isVisible()):
+            return False
+        target = obj if isinstance(obj, QWidget) else None
+        if target is None or target.window() is not self.window():
+            return False
+        if target is self or self.isAncestorOf(target):
+            return False
+        # The user may legitimately be typing in another text field (on a
+        # dialog, for example).  Never take those keys away from it.
+        if isinstance(target, (QLineEdit, QAbstractSpinBox,
+                               QTextEdit, QPlainTextEdit)):
+            return False
+        app = QApplication.instance()
+        if app is None:
+            return False
+        if app.activePopupWidget() is not None or app.activeModalWidget() is not None:
+            return False
+        ctrl_enter = (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                      and bool(event.modifiers()
+                               & Qt.KeyboardModifier.ControlModifier))
+        if not ctrl_enter and event.modifiers() & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.MetaModifier):
+            return False
+        key = event.key()
+        if key in (Qt.Key.Key_Shift, Qt.Key.Key_Control,
+                   Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return False
+        editing_keys = (
+            Qt.Key.Key_Backspace, Qt.Key.Key_Delete,
+            Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+            Qt.Key.Key_Home, Qt.Key.Key_End, Qt.Key.Key_PageUp,
+            Qt.Key.Key_PageDown, Qt.Key.Key_Return, Qt.Key.Key_Enter,
+            Qt.Key.Key_Escape, Qt.Key.Key_Tab, Qt.Key.Key_Backtab,
+        )
+        if not event.text() and key not in editing_keys:
+            return False
+        self._forwarding = True
+        try:
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.keyPressEvent(event)
+        finally:
+            self._forwarding = False
+        return True
+
+    def focusInEvent(self, event):
+        self._focus_timer.stop()
+        super().focusInEvent(event)
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
-        self._finish(True, self.toPlainText())
+        if self._closing or self._done:
+            return
+        # Windows can move focus away for a moment (IME, window activation,
+        # style polish) or even permanently after the first keystroke.  Do not
+        # commit here: keep the editor alive and take focus back.  Real exits
+        # are handled by clicks outside (eventFilter), Tab, Escape and
+        # Ctrl+Enter.
+        self._focus_timer.start()
+
+    def _reclaim_focus(self) -> None:
+        if self._closing or self._done or not self.isVisible():
+            return
+        if not self._app_active or not self.window().isActiveWindow():
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        if app.activePopupWidget() is not None or app.activeModalWidget() is not None:
+            # A menu/dialog/IME candidate is open; do not pull focus from it.
+            return
+        focus = app.focusWidget()
+        if focus is self:
+            return
+        if focus is not None and focus.window() is not self.window():
+            # Focus is in another window (dialog or popup).
+            return
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def close_editor(self) -> None:
+        """Mark this editor as intentionally closing (skips focus handling)."""
+        self._closing = True
+        self._focus_timer.stop()
+        self._remove_filter()
+        self.hide()
+
+    def _remove_filter(self) -> None:
+        if not self._filtering:
+            return
+        self._filtering = False
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _finish(self, ok: bool, text: str) -> None:
         if self._done:
             return
         self._done = True
+        self._closing = True
+        self._focus_timer.stop()
+        self._remove_filter()
         self.finished.emit(ok, text)
 
 
@@ -439,8 +671,6 @@ class EditorCanvas(QWidget):
         bottom = max(top + 4.0, min(self._page_h, rect.bottom()))
         return QRectF(left, top, right - left, bottom - top)
 
-    _QT_FAMILIES: dict[str, str] = {}
-
     def _natural_text_size(self, obj) -> tuple[float, float]:
         """Width/height (page units) the text needs on one line per paragraph.
 
@@ -448,15 +678,7 @@ class EditorCanvas(QWidget):
         pre-base vowels are counted the way they are drawn.
         """
         size = max(1.0, float(obj.font_size))
-        path = str(obj.font_path or "")
-        family = self._QT_FAMILIES.get(path)
-        if family is None:
-            family = ""
-            if path:
-                fid = QFontDatabase.addApplicationFont(path)
-                names = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
-                family = names[0] if names else ""
-            self._QT_FAMILIES[path] = family
+        family = font_family_for(str(obj.font_path or ""))
         scale = 8  # measure large, then divide: pixel sizes are integers
         font = QFont(family) if family else QFont()
         font.setPixelSize(max(1, int(round(size * scale))))
@@ -633,6 +855,9 @@ class EditorCanvas(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        # Clicking the page while an inline editor is open finishes editing,
+        # even if the platform did not deliver a focus-out event.
+        self._commit_open_inline()
         self.setFocus()
         point = event.position()
 
@@ -944,6 +1169,20 @@ class EditorCanvas(QWidget):
         super().wheelEvent(event)
 
     def keyPressEvent(self, event):
+        # Last-resort safety net: if the platform moved focus off the inline
+        # editor (Windows does this in some IME/window states), send the key
+        # there instead of dropping it on the canvas.  Shortcuts are left to
+        # the application so Save/Open/Undo still work.
+        if self._inline is not None:
+            _key, editor = self._inline
+            shortcuts = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                             | Qt.KeyboardModifier.AltModifier
+                                             | Qt.KeyboardModifier.MetaModifier)
+            if (not editor._done and editor.isVisible() and not shortcuts):
+                editor.setFocus(Qt.FocusReason.OtherFocusReason)
+                QApplication.sendEvent(editor, event)
+                event.accept()
+                return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
             event.accept()
@@ -1040,29 +1279,45 @@ class EditorCanvas(QWidget):
         else:
             painter.drawRect(rect)
 
+    def _commit_open_inline(self) -> None:
+        if self._inline is None:
+            return
+        open_key, open_editor = self._inline
+        self._finish_inline(True, open_editor.toPlainText(), open_key)
+
     def begin_inline_edit(self, key: str) -> None:
         obj = self._object_at(key)
         if not isinstance(obj, ec.TextObject):
             return
-        self._finish_inline(True, None)
+        self._commit_open_inline()
         self.before_change.emit("text")
         rect = self._widget_rect(obj.rect)
         target = QRectF(rect.x() - 3, rect.y() - 3,
                         max(90.0, rect.width() + 6), max(30.0, rect.height() + 6))
         editor = InlineEditor(obj.text, self)
         editor.setGeometry(target.toRect())
-        font = QFont(T.ui_font_family() or "Sans Serif")
-        font.setPixelSize(max(10, int(round(obj.font_size * self._zoom))))
+        pixel_size = max(10, int(round(obj.font_size * self._zoom)))
+        family_css = font_family_css(obj.font_path)
+        font = QFont()
+        families = editor_font_families(obj.font_path)
+        if families:
+            font.setFamilies(families)
+        font.setPixelSize(pixel_size)
         editor.setFont(font)
-        editor.finished.connect(lambda ok, text, k=key: self._finish_inline(ok, text, k))
-        editor.show()
-        editor.setFocus()
-        editor.selectAll()
+        # Apply the style before showing/focusing.  Re-polishing a focused
+        # editor after it opens is what let Windows bounce the focus away.
         editor.setStyleSheet(
             f"QPlainTextEdit#InlineEditor{{background: {T.SURFACE};"
             f" border: 1.4px solid {T.ACCENT}; border-radius: 4px;"
-            f" color: {T.TEXT}; padding: 2px;}}")
+            f" color: {T.TEXT}; padding: 2px;"
+            f"{f' font-family: {family_css};' if family_css else ''}"
+            f" font-size: {pixel_size}px;}}")
+        editor.finished.connect(lambda ok, text, k=key: self._finish_inline(ok, text, k))
         self._inline = (key, editor)
+        editor.show()
+        editor.raise_()
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
+        editor.selectAll()
 
     def _finish_inline(self, ok: bool, text: str | None, key: str | None = None) -> None:
         if self._inline is None:
@@ -1070,7 +1325,10 @@ class EditorCanvas(QWidget):
         open_key, editor = self._inline
         if key is not None and key != open_key:
             return
+        app = QApplication.instance()
+        focus_before = app.focusWidget() if app is not None else None
         self._inline = None
+        editor.close_editor()
         try:
             editor.finished.disconnect()
         except Exception:  # noqa: BLE001
@@ -1085,9 +1343,17 @@ class EditorCanvas(QWidget):
         if text is not None and text != obj.text:
             obj.text = text
             obj.label = text.strip().replace("\n", " ")[:60] or "Text"
+            fit_font_to_text(obj)
             self.changed.emit()
             self.committed.emit("Edited text")
-        self.setFocus()
+        # Return focus to the page only when the editor itself had it.  If the
+        # user clicked another widget, Qt already focused that widget and
+        # stealing focus back would make it look like only the first click
+        # worked.
+        if (focus_before is None or focus_before is editor
+                or (focus_before is not None
+                    and editor.isAncestorOf(focus_before))):
+            self.setFocus()
 
     def commit_inline(self) -> None:
         if self._inline is None:
@@ -1221,6 +1487,10 @@ class EditorInspector(Card):
         self._obj = None
         self._path = ""
         self._syncing = False
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(220)
+        self._fit_timer.timeout.connect(self._apply_font_fit)
 
         header = QHBoxLayout()
         header.setSpacing(8)
@@ -1253,6 +1523,13 @@ class EditorInspector(Card):
         self.text_edit = QPlainTextEdit()
         self.text_edit.setPlaceholderText("Type text here — Sinhala shaping is automatic…")
         self.text_edit.setFixedHeight(96)
+        # An explicit widget-level family also overrides the global ``*`` QSS
+        # rule, which otherwise drops the fallback chain and can leave Qt to
+        # guess a face for Sinhala on Windows.
+        families = font_family_css("")
+        if families:
+            self.text_edit.setStyleSheet(
+                f"QPlainTextEdit {{ font-family: {families}; }}")
         self.text_edit.textChanged.connect(self._text_changed)
         text_col.addWidget(self.text_edit)
 
@@ -1446,6 +1723,7 @@ class EditorInspector(Card):
     def show_object(self, obj, path: str) -> None:
         self._obj = obj
         self._path = path
+        self._fit_timer.stop()
         self._syncing = True
         is_text = isinstance(obj, ec.TextObject)
         is_image = isinstance(obj, ec.ImageObject)
@@ -1530,11 +1808,26 @@ class EditorInspector(Card):
         self.begin_change.emit("text")
         self._obj.text = self.text_edit.toPlainText()
         self._obj.label = self._obj.text.strip().replace("\n", " ")[:60] or "Text"
+        # Do the font switch after typing pauses.  Changing the combo and the
+        # preview synchronously on the first keystroke is what made Windows
+        # drop focus before the second character.
+        self._fit_timer.start()
         self.changed.emit()
+
+    def _apply_font_fit(self) -> None:
+        obj = self._obj
+        if self._syncing or not isinstance(obj, ec.TextObject):
+            return
+        before = obj.font_path
+        fit_font_to_text(obj)
+        if obj.font_path != before:
+            self.set_font_choice(obj.font_path)
+            self.changed.emit()
 
     def _font_changed(self, _index: int) -> None:
         if self._syncing or not isinstance(self._obj, ec.TextObject):
             return
+        self._fit_timer.stop()
         path = self.current_font()
         if not path or path == self._obj.font_path:
             return
