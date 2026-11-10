@@ -26,6 +26,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import (
+    QFontDatabase,
     QFontMetrics,
     QGuiApplication,
     QImage,
@@ -50,6 +51,7 @@ from PyQt6.QtWidgets import (
 import pdf_core as core
 import pdf_editor_core as editor
 import theme as T
+import win_text_input
 from editor_widgets import (
     EditorCanvas,
     EditorInspector,
@@ -2510,9 +2512,15 @@ def main() -> int:
     QApplication.setStyle("Fusion")
 
     app = QApplication(sys.argv)
-    family = T.ui_font_family()
-    if family:
-        app.setFont(T.font(13))
+    # Qt on Windows repeats the first letter typed with Sinhala keyboards
+    # (injected VK_PACKET text); this routes that text around the bug.
+    win_text_input.install(app)
+    for bundled in (editor.BUNDLED_SINHALA_REGULAR, editor.BUNDLED_SINHALA_BOLD):
+        if bundled.exists():
+            QFontDatabase.addApplicationFont(str(bundled))
+    # Always set a concrete family.  Leaving the family empty lets Qt/GDI pick
+    # a platform default, which on Windows can be a script face.
+    app.setFont(T.font(13))
     app.setStyleSheet(T.stylesheet())
 
     window = MainWindow()

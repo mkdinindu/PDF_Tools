@@ -59,20 +59,38 @@ _resolved_font: str | None = None
 
 
 def ui_font_family() -> str:
-    """Pick the first installed family from the stack."""
+    """Pick the first installed family from the stack.
+
+    The previous fallback was the literal string ``"Sans Serif"``, which is
+    not a real family on Windows.  Qt then handed the request to GDI, which
+    could substitute any font it liked (including script/handwriting faces).
+    Falling back to Qt's own system font keeps the UI on a real installed
+    sans-serif family.
+    """
     global _resolved_font
-    if _resolved_font is not None:
+    if _resolved_font:
         return _resolved_font
     try:
-        available = set(QFontDatabase.families())
+        available = {name.strip() for name in QFontDatabase.families()}
     except Exception:  # noqa: BLE001
         available = set()
-    _resolved_font = next((f for f in _FONT_STACK if f in available), "")
-    return _resolved_font
+    for family in _FONT_STACK:
+        if family in available:
+            _resolved_font = family
+            return _resolved_font
+    try:
+        system = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+        fallback = system.family().strip()
+    except Exception:  # noqa: BLE001
+        fallback = ""
+    if fallback:
+        _resolved_font = fallback
+    return _resolved_font or ""
 
 
 def font(size: int = 13, weight: int = 400, letter_spacing: float = 0.0) -> QFont:
-    f = QFont(ui_font_family() or "Sans Serif")
+    family = ui_font_family()
+    f = QFont(family) if family else QFont()
     f.setPixelSize(size)
     f.setWeight(QFont.Weight(weight))
     if letter_spacing:
@@ -365,10 +383,11 @@ def draw_icon(painter: QPainter, name: str, rect: QRectF, color: str = TEXT_MUTE
 
 # ---------------------------------------------------------------- stylesheet
 def stylesheet() -> str:
+    family = ui_font_family()
+    font_rule = f'    font-family: "{family}";\n' if family else ""
     return f"""
 * {{
-    font-family: "{ui_font_family() or 'Sans Serif'}";
-    outline: none;
+{font_rule}    outline: none;
 }}
 
 QWidget#Root {{
